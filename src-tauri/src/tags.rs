@@ -26,14 +26,25 @@ pub async fn write_file_tags(
 ) -> Result<()> {
     let path = Path::new(file_path);
     
+    if !path.exists() {
+        anyhow::bail!("File does not exist: {}", file_path);
+    }
+    
     if backup {
         let backup_path = path.with_extension(
             format!("{}.backup", path.extension().unwrap_or_default().to_string_lossy())
         );
-        std::fs::copy(path, backup_path)?;
+        std::fs::copy(path, &backup_path)?;
+        println!("📋 Backup created: {}", backup_path.display());
     }
     
-    let mut tagged_file = Probe::open(path)?.read()?;
+    println!("📝 Writing tags to: {}", file_path);
+    
+    let mut tagged_file = Probe::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?
+        .read()
+        .map_err(|e| anyhow::anyhow!("Failed to read file tags: {}", e))?;
+    
     let tag = if let Some(t) = tagged_file.primary_tag_mut() {
         t
     } else {
@@ -43,6 +54,8 @@ pub async fn write_file_tags(
     };
     
     for (field, change) in changes {
+        println!("   🔧 Updating {}: '{}' -> '{}'", field, change.old, change.new);
+        
         match field.as_str() {
             "title" => {
                 tag.remove_key(&ItemKey::TrackTitle);
@@ -57,17 +70,14 @@ pub async fn write_file_tags(
                 tag.set_album(change.new.clone());
             },
             "genre" => {
-                // Remove all old genre tags first
                 tag.remove_key(&ItemKey::Genre);
                 
-                // Split comma-separated genres
                 let genres: Vec<&str> = change.new
                     .split(',')
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .collect();
                 
-                // Write each genre as a separate TagItem
                 for genre in &genres {
                     let item = TagItem::new(
                         ItemKey::Genre,
@@ -76,22 +86,16 @@ pub async fn write_file_tags(
                     tag.push(item);
                 }
                 
-                println!("✅ Wrote {} separate genre tags: {:?}", genres.len(), genres);
+                println!("   ✅ Wrote {} separate genre tags: {:?}", genres.len(), genres);
             },
             "narrator" => {
-                // CRITICAL: Only write to Composer field
-                // AudiobookShelf reads narrator from Composer
                 tag.remove_key(&ItemKey::Composer);
                 tag.insert_text(ItemKey::Composer, change.new.clone());
-                
-                // IMPORTANT: Clear comment field to prevent narrator showing in description
                 tag.remove_key(&ItemKey::Comment);
                 
-                println!("✅ Wrote narrator to Composer: {}", change.new);
+                println!("   ✅ Wrote narrator to Composer: {}", change.new);
             },
             "description" | "comment" => {
-                // Only write actual description/comments (not narrator info)
-                // Skip if it contains "narrated by" (case insensitive)
                 if !change.new.to_lowercase().contains("narrated by") {
                     tag.set_comment(change.new.clone());
                 }
@@ -109,24 +113,26 @@ pub async fn write_file_tags(
                 tag.insert_text(ItemKey::Unknown("SERIES-PART".to_string()), change.new.clone());
                 tag.insert_text(ItemKey::Unknown("series-part".to_string()), change.new.clone());
             },
-            _ => {}
+            _ => {
+                println!("   ⚠️  Unknown field type: {}", field);
+            }
         }
     }
     
-    // Save with default options
-    tagged_file.save_to_path(path, lofty::config::WriteOptions::default())?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    
+    tagged_file.save_to_path(path, lofty::config::WriteOptions::default())
+        .map_err(|e| anyhow::anyhow!("Failed to save tags: {}", e))?;
     
     println!("✅ Saved tags to: {}", file_path);
     
     Ok(())
 }
 
-// Helper function to verify genres were written correctly
 pub fn verify_genres(file_path: &str) -> Result<Vec<String>> {
     let tagged_file = Probe::open(file_path)?.read()?;
     let tag = tagged_file.primary_tag().ok_or_else(|| anyhow::anyhow!("No tag found"))?;
     
-    // Get all genre tags
     let genres: Vec<String> = tag
         .get_strings(&ItemKey::Genre)
         .map(|s| s.to_string())
