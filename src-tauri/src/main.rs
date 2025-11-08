@@ -672,13 +672,15 @@ fn build_update_payload(metadata: &scanner::BookMetadata) -> Value {
         metadata_map.insert("publisher".to_string(), json!(publisher));
     }
 
-    if let Some(year) = metadata
+    if let Some(year_str) = metadata
         .year
         .as_ref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        metadata_map.insert("publishedYear".to_string(), json!(year));
+        if let Ok(year) = year_str.parse::<i32>() {
+            metadata_map.insert("publishedYear".to_string(), json!(year));
+        }
     }
 
     if let Some(isbn) = metadata
@@ -726,13 +728,15 @@ fn build_update_payload(metadata: &scanner::BookMetadata) -> Value {
         series_entry.insert("id".to_string(), json!("new-1"));
         series_entry.insert("name".to_string(), json!(series_name));
 
-        if let Some(sequence) = metadata
+        if let Some(sequence_str) = metadata
             .sequence
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            series_entry.insert("sequence".to_string(), json!(sequence));
+            if let Ok(sequence) = sequence_str.parse::<f64>() {
+                series_entry.insert("sequence".to_string(), json!(sequence));
+            }
         }
 
         metadata_map.insert(
