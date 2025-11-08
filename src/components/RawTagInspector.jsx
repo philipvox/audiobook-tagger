@@ -10,6 +10,12 @@ export function RawTagInspector({ isOpen, onClose }) {
   const [tagData, setTagData] = useState(null);
   const [error, setError] = useState(null);
 
+  const getFileName = (path) => {
+    if (!path) return '';
+    const segments = path.split(/[\\/]/);
+    return segments.pop() || path;
+  };
+
   const handleSelectFile = async () => {
     try {
       const selected = await open({
@@ -26,8 +32,8 @@ export function RawTagInspector({ isOpen, onClose }) {
       setLoading(true);
       setError(null);
       
-      const result = await invoke('inspect_file_tags', { 
-        filePath: selected 
+      const result = await invoke('inspect_file_tags', {
+        file_path: selected
       });
       
       setTagData(result);
@@ -39,8 +45,12 @@ export function RawTagInspector({ isOpen, onClose }) {
     }
   };
 
-  const copyToClipboard = (text) => {
-    navigator.clipboard.writeText(text);
+  const copyToClipboard = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (clipboardError) {
+      console.error('Clipboard copy failed:', clipboardError);
+    }
   };
 
   const formatDuration = (seconds) => {
@@ -121,14 +131,27 @@ export function RawTagInspector({ isOpen, onClose }) {
                   File Information
                 </h3>
                 
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="bg-white rounded-lg p-4 border border-gray-200">
-                    <div className="text-xs text-gray-500 mb-1">File Path</div>
-                    <div className="text-sm font-mono text-gray-900 truncate">
-                      {tagData.file_path.split('/').pop()}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="bg-white rounded-lg p-4 border border-gray-200 md:col-span-2 space-y-2">
+                    <div className="text-xs text-gray-500 uppercase tracking-wide">File Path</div>
+                    <div className="flex flex-col gap-2">
+                      <div className="text-sm font-semibold text-gray-900 break-all">
+                        {tagData.file_path}
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-gray-500">
+                        <span className="px-2 py-1 bg-gray-100 rounded">{getFileName(tagData.file_path)}</span>
+                        <button
+                          onClick={() => copyToClipboard(tagData.file_path)}
+                          className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded transition-colors"
+                          title="Copy full path"
+                        >
+                          <Copy className="w-3 h-3" />
+                          Copy Path
+                        </button>
+                      </div>
                     </div>
                   </div>
-                  
+
                   <div className="bg-white rounded-lg p-4 border border-gray-200">
                     <div className="text-xs text-gray-500 mb-1">Format</div>
                     <div className="text-sm font-semibold text-gray-900">
