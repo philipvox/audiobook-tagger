@@ -32,14 +32,19 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
 
     // Get audio properties
     let properties = tagged_file.properties();
-    let duration_seconds = Some(properties.duration().as_secs());
+    let duration_secs = properties.duration().as_secs();
+    let duration_seconds = if duration_secs > 0 {
+        Some(duration_secs)
+    } else {
+        None
+    };
     let bitrate = properties.audio_bitrate();
     let sample_rate = properties.sample_rate();
 
     let mut tags = Vec::new();
 
     // Get all tags from the file
-    if let Some(tag) = tagged_file.primary_tag() {
+    if let Some(tag) = primary_tag {
         let tag_type = format!("{:?}", tag.tag_type());
 
         // Standard fields
@@ -149,7 +154,7 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
 
     // Check other tag types too
     for tag in tagged_file.tags() {
-        if Some(tag) == tagged_file.primary_tag() {
+        if Some(tag) == primary_tag {
             continue; // Already processed
         }
 
