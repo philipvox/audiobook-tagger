@@ -1,4 +1,3 @@
-cat > ~/Desktop/Code\ Projects/audiobook-tagger-working/src-tauri/src/main.rs << 'EOF'
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
@@ -584,4 +583,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-EOF
