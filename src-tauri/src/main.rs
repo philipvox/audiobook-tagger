@@ -382,17 +382,28 @@ async fn push_abs_updates(request: PushRequest) -> Result<PushResult, String> {
     let client = reqwest::Client::new();
     let library_items = fetch_abs_library_items(&client, &config).await?;
     
+    println!("📊 AudiobookShelf has {} items", library_items.len());
+    println!("📋 Sample paths from AudiobookShelf (first 10):");
+    for (idx, (path, item)) in library_items.iter().take(10).enumerate() {
+        println!("  {}. [{}] {}", idx + 1, item.id, path);
+    }
+    println!();
+    
     let mut unmatched = Vec::new();
     let mut targets = Vec::new();
     let mut seen_ids = HashSet::new();
     
     for item in &request.items {
         let normalized_path = normalize_path(&item.path);
+        println!("🔍 Looking for: '{}'", normalized_path);
+        
         if let Some(library_item) = find_matching_item(&normalized_path, &library_items) {
+            println!("   ✅ Found match: [{}] {}", library_item.id, library_item.path);
             if seen_ids.insert(library_item.id.clone()) {
                 targets.push((library_item.id.clone(), item.clone()));
             }
         } else {
+            println!("   ❌ No match found");
             unmatched.push(item.path.clone());
         }
     }
