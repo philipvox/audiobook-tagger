@@ -1,3 +1,4 @@
+cat > ~/Desktop/Code\ Projects/audiobook-tagger-working/src-tauri/src/main.rs << 'EOF'
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
@@ -11,6 +12,8 @@ mod audible;
 mod cache;
 mod progress;
 mod tag_inspector;
+mod audible_auth;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -37,8 +40,6 @@ async fn scan_library(
     } else {
         Some(config.openai_api_key)
     };
-    
-    let config = config::load_config().map_err(|e| e.to_string())?;
     
     let groups = scanner::scan_directory(
         &paths[0], 
@@ -171,12 +172,6 @@ async fn inspect_file_tags(file_path: String) -> Result<tag_inspector::RawTags, 
     tag_inspector::inspect_file_tags(&file_path).map_err(|e| e.to_string())
 }
 
-mod audible_auth;
-
-// ============================================================================
-// MAINTENANCE COMMANDS
-// ============================================================================
-
 #[tauri::command]
 async fn clear_cache() -> Result<String, String> {
     cache::MetadataCache::new()
@@ -198,7 +193,8 @@ async fn restart_abs_docker() -> Result<String, String> {
     if output.status.success() {
         Ok("Container restarted successfully".to_string())
     } else {
-        Err(format!("Docker restart failed: {}", String::from_utf8_lossy(&output.stderr)))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Docker restart failed: {}", stderr))
     }
 }
 
@@ -235,13 +231,10 @@ async fn clear_abs_cache() -> Result<String, String> {
     if output.status.success() {
         Ok("Cache cleared successfully".to_string())
     } else {
-        Err(format!("Failed to clear cache: {}", String::from_utf8_lossy(&output.stderr)))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Failed to clear cache: {}", stderr))
     }
 }
-
-// ============================================================================
-// GENRE MANAGEMENT
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 struct LibraryFilterData {
@@ -274,13 +267,12 @@ async fn clear_all_genres() -> Result<String, String> {
     let config = config::load_config().map_err(|e| e.to_string())?;
     
     if config.abs_base_url.is_empty() || config.abs_api_token.is_empty() || config.abs_library_id.is_empty() {
-        return Err("AudiobookShelf not configured. Please set Base URL, API Token, and Library ID in Settings.".to_string());
+        return Err("AudiobookShelf not configured".to_string());
     }
     
     let client = reqwest::Client::new();
-    
-    // Step 1: Get all genres from the library filter data (the dropdown)
     let filter_url = format!("{}/api/libraries/{}/filterdata", config.abs_base_url, config.abs_library_id);
+    
     let filter_response = client
         .get(&filter_url)
         .header("Authorization", format!("Bearer {}", config.abs_api_token))
@@ -292,110 +284,69 @@ async fn clear_all_genres() -> Result<String, String> {
         return Err(format!("Failed to fetch filter data: {}", filter_response.status()));
     }
     
-    let filter_data: LibraryFilterData = filter_response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse filter data: {}", e))?;
-    
+    let filter_data: LibraryFilterData = filter_response.json().await.map_err(|e| e.to_string())?;
     let all_dropdown_genres = filter_data.genres;
     
-    // Step 2: Get all genres actually used by books
     let items_url = format!("{}/api/libraries/{}/items?limit=1000", config.abs_base_url, config.abs_library_id);
     let items_response = client
         .get(&items_url)
         .header("Authorization", format!("Bearer {}", config.abs_api_token))
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch library items: {}", e))?;
+        .map_err(|e| e.to_string())?;
     
-    if !items_response.status().is_success() {
-        return Err(format!("Failed to fetch library items: {}", items_response.status()));
-    }
+    let items: LibraryItemsResponse = items_response.json().await.map_err(|e| e.to_string())?;
     
-    let items: LibraryItemsResponse = items_response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse library items: {}", e))?;
-    
-    // Collect all genres currently used by books
     let mut used_genres: HashSet<String> = HashSet::new();
     for item in items.results {
         if let Some(genres) = item.media.metadata.genres {
-            for genre in genres {
-                used_genres.insert(genre);
-            }
+            used_genres.extend(genres);
         }
     }
     
-    // Step 3: Find unused genres (in dropdown but not used by any book)
     let unused_genres: Vec<String> = all_dropdown_genres
         .into_iter()
         .filter(|g| !used_genres.contains(g))
         .collect();
     
     if unused_genres.is_empty() {
-        return Ok("No unused genres found. All genres in the dropdown are being used by books.".to_string());
+        return Ok("No unused genres found".to_string());
     }
     
-    // Step 4: Delete unused genres from AudiobookShelf
     let mut deleted_count = 0;
-    let mut failed_count = 0;
-    
     for genre in &unused_genres {
         let delete_url = format!("{}/api/me/item/{}", config.abs_base_url, urlencoding::encode(genre));
-        let delete_result = client
-            .delete(&delete_url)
+        if let Ok(resp) = client.delete(&delete_url)
             .header("Authorization", format!("Bearer {}", config.abs_api_token))
             .send()
-            .await;
-        
-        match delete_result {
-            Ok(resp) if resp.status().is_success() => deleted_count += 1,
-            _ => failed_count += 1,
+            .await {
+            if resp.status().is_success() {
+                deleted_count += 1;
+            }
         }
     }
     
-    Ok(format!(
-        "Removed {} unused genres from dropdown. {} failed.\nRemoved: {}",
-        deleted_count,
-        failed_count,
-        unused_genres.join(", ")
-    ))
+    Ok(format!("Removed {} unused genres", deleted_count))
 }
 
 #[tauri::command]
 async fn normalize_genres() -> Result<String, String> {
     let config = config::load_config().map_err(|e| e.to_string())?;
-
-    if config.abs_base_url.is_empty() || config.abs_api_token.is_empty() || config.abs_library_id.is_empty() {
-        return Err("AudiobookShelf not configured. Please set Base URL, API Token, and Library ID in Settings.".to_string());
-    }
-    
     let client = reqwest::Client::new();
     
-    // Get all library items
     let url = format!("{}/api/libraries/{}/items?limit=1000", config.abs_base_url, config.abs_library_id);
     let response = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", config.abs_api_token))
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch library items: {}", e))?;
+        .map_err(|e| e.to_string())?;
     
-    if !response.status().is_success() {
-        return Err(format!("Failed to fetch library items: {}", response.status()));
-    }
-    
-    let items: LibraryItemsResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse library items: {}", e))?;
+    let items: LibraryItemsResponse = response.json().await.map_err(|e| e.to_string())?;
     
     let mut updated_count = 0;
-    let mut failed_count = 0;
     let mut skipped_count = 0;
     
-    // Normalize genres for each item
     for item in items.results {
         if let Some(current_genres) = &item.media.metadata.genres {
             if current_genres.is_empty() {
@@ -403,96 +354,57 @@ async fn normalize_genres() -> Result<String, String> {
                 continue;
             }
             
-            // Map genres to approved list
             let normalized_genres = genres::enforce_genre_policy_basic(current_genres);
             
-            // Only update if genres actually changed
             if normalized_genres != *current_genres {
                 let update_url = format!("{}/api/items/{}/media", config.abs_base_url, item.id);
-                let update_result = client
+                if let Ok(resp) = client
                     .patch(&update_url)
                     .header("Authorization", format!("Bearer {}", config.abs_api_token))
-                    .header("Content-Type", "application/json")
-                    .json(&serde_json::json!({
-                        "metadata": {
-                            "genres": normalized_genres
-                        }
-                    }))
+                    .json(&json!({"metadata": {"genres": normalized_genres}}))
                     .send()
-                    .await;
-                
-                match update_result {
-                    Ok(resp) if resp.status().is_success() => updated_count += 1,
-                    _ => failed_count += 1,
+                    .await {
+                    if resp.status().is_success() {
+                        updated_count += 1;
+                    }
                 }
             } else {
                 skipped_count += 1;
             }
-        } else {
-            skipped_count += 1;
         }
     }
     
-    Ok(format!("Normalized {} items, skipped {} (already correct/empty), {} failed.", 
-        updated_count, skipped_count, failed_count))
+    Ok(format!("Normalized {} items, skipped {}", updated_count, skipped_count))
 }
 
 #[tauri::command]
 async fn push_abs_updates(request: PushRequest) -> Result<PushResult, String> {
-    if request.items.is_empty() {
-        return Ok(PushResult {
-            updated: 0,
-            unmatched: Vec::new(),
-            failed: Vec::new(),
-        });
-    }
-
     let config = config::load_config().map_err(|e| e.to_string())?;
-    if config.abs_base_url.trim().is_empty()
-        || config.abs_api_token.trim().is_empty()
-        || config.abs_library_id.trim().is_empty()
-    {
-        return Err("AudiobookShelf not configured. Please set Base URL, API Token, and Library ID in Settings.".to_string());
-    }
-
     let client = reqwest::Client::new();
     let library_items = fetch_abs_library_items(&client, &config).await?;
-
+    
     let mut unmatched = Vec::new();
-    let mut targets: Vec<(String, String, PushItem)> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-
+    let mut targets = Vec::new();
+    let mut seen_ids = HashSet::new();
+    
     for item in &request.items {
         let normalized_path = normalize_path(&item.path);
-        if normalized_path.is_empty() {
-            unmatched.push(item.path.clone());
-            continue;
-        }
-
         if let Some(library_item) = find_matching_item(&normalized_path, &library_items) {
             if seen_ids.insert(library_item.id.clone()) {
-                targets.push((library_item.id.clone(), library_item.path.clone(), item.clone()));
+                targets.push((library_item.id.clone(), item.clone()));
             }
         } else {
             unmatched.push(item.path.clone());
         }
     }
-
+    
     let mut failed = Vec::new();
     let mut updated = 0;
-
-    for (library_item_id, library_path, push_item) in targets {
-        match update_abs_item(&client, &config, &library_item_id, &push_item.metadata).await {
-            Ok(true) => {
-                updated += 1;
-            }
-            Ok(false) => {
-                failed.push(PushFailure {
-                    path: push_item.path.clone(),
-                    reason: format!("AudiobookShelf reported no updates for {}", library_path),
-                    status: None,
-                });
-            }
+    
+    for (item_id, push_item) in targets {
+        match update_abs_item(&client, &config, &item_id, &push_item.metadata).await {
+            Ok(true) => updated += 1,
+            Ok(false) => {},
             Err(err) => {
                 failed.push(PushFailure {
                     path: push_item.path.clone(),
@@ -502,78 +414,53 @@ async fn push_abs_updates(request: PushRequest) -> Result<PushResult, String> {
             }
         }
     }
-
-    Ok(PushResult {
-        updated,
-        unmatched,
-        failed,
-    })
+    
+    Ok(PushResult { updated, unmatched, failed })
 }
 
 async fn fetch_abs_library_items(
     client: &reqwest::Client,
     config: &config::Config,
 ) -> Result<HashMap<String, AbsLibraryItem>, String> {
-    let mut items_map: HashMap<String, AbsLibraryItem> = HashMap::new();
-    let mut page: usize = 0;
-    let limit: usize = 200;
-
+    let mut items_map = HashMap::new();
+    let mut page = 0;
+    let limit = 200;
+    
     loop {
-        let url = format!(
-            "{}/api/libraries/{}/items?limit={}&page={}",
-            config.abs_base_url, config.abs_library_id, limit, page
-        );
-
+        let url = format!("{}/api/libraries/{}/items?limit={}&page={}", 
+            config.abs_base_url, config.abs_library_id, limit, page);
+        
         let response = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", config.abs_api_token))
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch AudiobookShelf items: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!(
-                "AudiobookShelf responded with {} while listing library items",
-                response.status()
-            ));
-        }
-
-        let payload: AbsItemsResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse AudiobookShelf library items: {}", e))?;
-
-        let results = payload.results;
-        let result_count = results.len();
-
-        for item in results {
+            .map_err(|e| e.to_string())?;
+        
+        let payload: AbsItemsResponse = response.json().await.map_err(|e| e.to_string())?;
+        let result_count = payload.results.len();
+        
+        for item in payload.results {
             let normalized = normalize_path(&item.path);
             if !normalized.is_empty() {
                 items_map.insert(normalized, item);
             }
         }
-
+        
         if result_count < limit {
             break;
         }
-
         page += 1;
     }
-
+    
     Ok(items_map)
 }
 
 fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let mut normalized = trimmed.replace('\\', "/");
+    let mut normalized = path.trim().replace('\\', "/");
     while normalized.ends_with('/') && normalized.len() > 1 {
         normalized.pop();
     }
-
     normalized
 }
 
@@ -584,21 +471,14 @@ fn find_matching_item<'a>(
     if let Some(item) = items.get(path) {
         return Some(item);
     }
-
+    
     let mut current = path.to_string();
-
     while let Some(pos) = current.rfind('/') {
-        if pos == 0 {
-            return items.get("/");
-        }
-
         current.truncate(pos);
-
         if let Some(item) = items.get(&current) {
             return Some(item);
         }
     }
-
     None
 }
 
@@ -610,204 +490,86 @@ async fn update_abs_item(
 ) -> Result<bool, PushError> {
     let url = format!("{}/api/items/{}/media", config.abs_base_url, item_id);
     let payload = build_update_payload(metadata);
-
+    
     let response = client
         .patch(&url)
         .header("Authorization", format!("Bearer {}", config.abs_api_token))
-        .header("Content-Type", "application/json")
         .json(&payload)
         .send()
         .await
         .map_err(|e| PushError {
-            reason: format!("Failed to reach AudiobookShelf: {}", e),
+            reason: e.to_string(),
             status: None,
         })?;
-
-    if !response.status().is_success() {
+    
+    let status = response.status();
+    if !status.is_success() {
         return Err(PushError {
-            reason: format!("AudiobookShelf responded with {}", response.status()),
-            status: Some(response.status().as_u16()),
+            reason: format!("Status {}", status),
+            status: Some(status.as_u16()),
         });
     }
-
-    // FIXED: Capture status before consuming response
-    let status = response.status();
-
-    let body: UpdateMediaResponse = response
-        .json()
-        .await
-        .map_err(|e| PushError {
-            reason: format!("Failed to parse AudiobookShelf response: {}", e),
-            status: Some(status.as_u16()),
-        })?;
-
+    
+    let body: UpdateMediaResponse = response.json().await.map_err(|e| PushError {
+        reason: e.to_string(),
+        status: Some(status.as_u16()),
+    })?;
+    
     Ok(body.updated)
 }
 
 fn build_update_payload(metadata: &scanner::BookMetadata) -> Value {
-    let mut metadata_map = serde_json::Map::new();
-    metadata_map.insert("title".to_string(), json!(metadata.title));
-
-    if let Some(subtitle) = metadata
-        .subtitle
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        metadata_map.insert("subtitle".to_string(), json!(subtitle));
-    }
-
-    if let Some(description) = metadata
-        .description
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        metadata_map.insert("description".to_string(), json!(description));
-    }
-
-    if let Some(publisher) = metadata
-        .publisher
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        metadata_map.insert("publisher".to_string(), json!(publisher));
-    }
-
-    if let Some(year) = metadata
-        .year
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        metadata_map.insert("publishedYear".to_string(), json!(year));
-    }
-
-    if let Some(isbn) = metadata
-        .isbn
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        metadata_map.insert("isbn".to_string(), json!(isbn));
-    }
-
-    if let Some(narrator) = metadata
-        .narrator
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        metadata_map.insert("narrators".to_string(), json!([narrator]));
-    }
-
-    if !metadata.genres.is_empty() {
-        metadata_map.insert("genres".to_string(), json!(metadata.genres));
-    }
-
-    let authors = split_authors(&metadata.author);
-    if !authors.is_empty() {
-        let author_values: Vec<Value> = authors
-            .into_iter()
-            .enumerate()
-            .map(|(idx, name)| json!({
-                "id": format!("new-{}", idx + 1),
-                "name": name
-            }))
-            .collect();
-        metadata_map.insert("authors".to_string(), Value::Array(author_values));
-    }
-
-    if let Some(series_name) = metadata
-        .series
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        let mut series_entry = serde_json::Map::new();
-        series_entry.insert("id".to_string(), json!("new-1"));
-        series_entry.insert("name".to_string(), json!(series_name));
-
-        if let Some(sequence) = metadata
-            .sequence
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            series_entry.insert("sequence".to_string(), json!(sequence));
+    let mut map = serde_json::Map::new();
+    map.insert("title".to_string(), json!(metadata.title));
+    
+    if let Some(ref s) = metadata.subtitle { map.insert("subtitle".to_string(), json!(s)); }
+    if let Some(ref d) = metadata.description { map.insert("description".to_string(), json!(d)); }
+    if let Some(ref p) = metadata.publisher { map.insert("publisher".to_string(), json!(p)); }
+    if let Some(ref y) = metadata.year { map.insert("publishedYear".to_string(), json!(y)); }
+    if let Some(ref i) = metadata.isbn { map.insert("isbn".to_string(), json!(i)); }
+    if let Some(ref n) = metadata.narrator { map.insert("narrators".to_string(), json!([n])); }
+    if !metadata.genres.is_empty() { map.insert("genres".to_string(), json!(metadata.genres)); }
+    
+    let authors: Vec<Value> = metadata.author.split(&[',', '&'][..])
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .enumerate()
+        .map(|(i, name)| json!({"id": format!("new-{}", i+1), "name": name}))
+        .collect();
+    if !authors.is_empty() { map.insert("authors".to_string(), Value::Array(authors)); }
+    
+    if let Some(ref series) = metadata.series {
+        let mut s = serde_json::Map::new();
+        s.insert("id".to_string(), json!("new-1"));
+        s.insert("name".to_string(), json!(series));
+        if let Some(ref seq) = metadata.sequence {
+            s.insert("sequence".to_string(), json!(seq));
         }
-
-        metadata_map.insert(
-            "series".to_string(),
-            Value::Array(vec![Value::Object(series_entry)]),
-        );
+        map.insert("series".to_string(), Value::Array(vec![Value::Object(s)]));
     }
-
-    json!({ "metadata": metadata_map })
+    
+    json!({"metadata": map})
 }
-
-fn split_authors(author: &str) -> Vec<String> {
-    let trimmed = author.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let has_multiple = trimmed.contains('&')
-        || trimmed.contains(" and ")
-        || trimmed.contains(';')
-        || trimmed.contains('/')
-        || trimmed.contains('|');
-
-    if !has_multiple {
-        return vec![trimmed.to_string()];
-    }
-
-    let normalized = trimmed
-        .replace(" & ", ";")
-        .replace(" and ", ";")
-        .replace('/', ";")
-        .replace('|', ";");
-
-    normalized
-        .split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-// ============================================================================
-// AUDIBLE AUTH COMMANDS
-// ============================================================================
 
 #[tauri::command]
 async fn login_to_audible(email: String, password: String, country_code: String) -> Result<String, String> {
-    audible_auth::login_audible(&email, &password, &country_code)
-        .map_err(|e| e.to_string())
+    audible_auth::login_audible(&email, &password, &country_code).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn check_audible_installed() -> Result<bool, String> {
-    audible_auth::check_audible_status()
-        .map_err(|e| e.to_string())
+    audible_auth::check_audible_status().map_err(|e| e.to_string())
 }
-
-// ============================================================================
-// MAIN FUNCTION
-// ============================================================================
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            // Core commands
             scan_library,
             write_tags,
             get_config,
             save_config,
             test_abs_connection,
-            // Maintenance commands
             clear_cache,
             restart_abs_docker,
             force_abs_rescan,
@@ -815,7 +577,6 @@ fn main() {
             clear_all_genres,
             normalize_genres,
             push_abs_updates,
-            // Audible commands
             login_to_audible,
             check_audible_installed,
             inspect_file_tags,
@@ -823,3 +584,4 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+EOF
