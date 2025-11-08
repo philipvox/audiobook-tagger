@@ -10,6 +10,7 @@ mod processor;
 mod audible;
 mod cache;
 mod progress;
+mod tag_inspector;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -109,6 +110,11 @@ async fn test_abs_connection(config: config::Config) -> Result<ConnectionTest, S
 struct ConnectionTest {
     success: bool,
     message: String,
+}
+
+#[tauri::command]
+async fn inspect_file_tags(file_path: String) -> Result<tag_inspector::RawTags, String> {
+    tag_inspector::inspect_file_tags(&file_path).map_err(|e| e.to_string())
 }
 
 mod audible_auth;
@@ -417,6 +423,7 @@ fn main() {
             // Audible commands
             login_to_audible,
             check_audible_installed,
+            inspect_file_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
