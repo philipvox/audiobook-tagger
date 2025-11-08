@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, Clock, Zap, FileSearch } from 'lucide-react';
+import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, Clock, Zap, FileSearch, AlertCircle, } from 'lucide-react';
 import { RawTagInspector } from './components/RawTagInspector';
 
 function App() {
@@ -25,7 +25,8 @@ function App() {
   const [selectedGroups, setSelectedGroups] = useState([]);
   const [scanStartTime, setScanStartTime] = useState(null);
   const [showTagInspector, setShowTagInspector] = useState(false);
-  const [lastWrittenItems, setLastWrittenItems] = useState([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [showRefreshOptions, setShowRefreshOptions] = useState(false);  const [lastWrittenItems, setLastWrittenItems] = useState([]);
 
   useEffect(() => {
     loadConfig();
@@ -357,7 +358,7 @@ function App() {
               onClick={() => setShowTagInspector(true)}
               className="btn btn-secondary flex items-center gap-2"
             >
-              <FileSearch className="w-4 h-4" />
+              <FileSearch, AlertCircle, Zap className="w-4 h-4" />
               Inspect Tags
             </button>
           </div>
