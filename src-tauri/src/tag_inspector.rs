@@ -4,6 +4,7 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, ItemValue};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::ptr;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RawTags {
@@ -156,7 +157,10 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
 
     // Check other tag types too
     for tag in tagged_file.tags() {
-        if Some(tag) == primary_tag {
+        if primary_tag
+            .map(|primary| ptr::eq(primary, tag))
+            .unwrap_or(false)
+        {
             continue; // Already processed
         }
 
