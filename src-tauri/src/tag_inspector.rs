@@ -1,10 +1,9 @@
 use anyhow::Result;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::{Accessor, ItemKey, ItemValue, Tag};
+use lofty::tag::{Accessor, ItemKey, ItemValue};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::ptr;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RawTags {
@@ -44,7 +43,10 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
 
     let mut tags = Vec::new();
 
-    let primary_tag_ptr: Option<*const Tag> = if let Some(tag) = tagged_file.primary_tag() {
+    let primary_tag = tagged_file.primary_tag();
+
+    // Get all tags from the file
+    if let Some(tag) = primary_tag {
         let tag_type = format!("{:?}", tag.tag_type());
 
         // Standard fields
@@ -150,14 +152,11 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
                 tag_type: tag_type.clone(),
             });
         }
-        Some(tag as *const Tag)
-    } else {
-        None
-    };
+    }
 
     // Check other tag types too
     for tag in tagged_file.tags() {
-        if primary_tag_ptr.is_some_and(|ptr| ptr::eq(ptr, tag as *const Tag)) {
+        if Some(tag) == primary_tag {
             continue; // Already processed
         }
 
