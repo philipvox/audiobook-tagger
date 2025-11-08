@@ -487,26 +487,55 @@ fn find_matching_item<'a>(
         current.truncate(pos);
         if let Some(item) = items.get(&current) {
             return Some(item);
+fn extract_book_folder(path: &str) -> Option<String> {
+    let normalized = normalize_path(path);
+    
+    let parts: Vec<&str> = normalized.split('/').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    
+    for part in parts.iter().rev() {
+        if !part.is_empty() && part.contains('[') && part.ends_with(']') {
+            return Some((*part).to_string());
+        }
+    }
+    
+    if let Some(last) = parts.iter().rev().find(|p| !p.is_empty() && !p.ends_with(".m4b") && !p.ends_with(".m4a") && !p.ends_with(".mp3")) {
+        return Some((*last).to_string());
+    }
+    
+    None
+}
+
+fn find_matching_item<'a>(
+    path: &str,
+    items: &'a HashMap<String, AbsLibraryItem>,
+) -> Option<&'a AbsLibraryItem> {
+    if let Some(item) = items.get(path) {
+        return Some(item);
+    }
+    
+    if let Some(book_folder) = extract_book_folder(path) {
+        println!("   📁 Extracted folder: '{}'", book_folder);
+        
+        for (abs_path, item) in items.iter() {
+            if abs_path.ends_with(&book_folder) {
+                println!("   ✨ Matched via folder name: '{}'", abs_path);
+                return Some(item);
+            }
+        }
+    }
+    
+    let mut current = path.to_string();
+    while let Some(pos) = current.rfind('/') {
+        current.truncate(pos);
+        if let Some(item) = items.get(&current) {
+            return Some(item);
         }
     }
     None
 }
-
-async fn update_abs_item(
-    client: &reqwest::Client,
-    config: &config::Config,
-    item_id: &str,
-    metadata: &scanner::BookMetadata,
-) -> Result<bool, PushError> {
-    let url = format!("{}/api/items/{}/media", config.abs_base_url, item_id);
-    let payload = build_update_payload(metadata);
-    
-    let response = client
-        .patch(&url)
-        .header("Authorization", format!("Bearer {}", config.abs_api_token))
-        .json(&payload)
-        .send()
-        .await
         .map_err(|e| PushError {
             reason: e.to_string(),
             status: None,
