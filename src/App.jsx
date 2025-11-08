@@ -1,9 +1,8 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { FileAudio, RefreshCw, Wrench, Settings, Upload, Save, ChevronRight, ChevronDown, Folder, Book, Files, Clock, Zap } from 'lucide-react';
+import { FileAudio, RefreshCw, Wrench, Settings, Upload, Save, ChevronRight, ChevronDown, Folder, Book, Files, Clock, Zap, FileSearch } from 'lucide-react';
 import { RawTagInspector } from './components/RawTagInspector';
-import { FileSearch } from 'lucide-react';
 
 function App() {
   const [activeTab, setActiveTab] = useState('scanner');
@@ -260,13 +259,13 @@ function App() {
                 {writing ? 'Writing...' : `Write ${selectedFiles.size} Files`}
               </button>
             )}
-            <button 
-                onClick={() => setShowTagInspector(true)}
-                className="btn btn-secondary flex items-center gap-2"
-              >
-                <FileSearch className="w-4 h-4" />
-                Inspect Tags
-              </button>
+            <button
+              onClick={() => setShowTagInspector(true)}
+              className="btn btn-secondary flex items-center gap-2"
+            >
+              <FileSearch className="w-4 h-4" />
+              Inspect Tags
+            </button>
           </div>
         </div>
       </header>
