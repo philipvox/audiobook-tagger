@@ -33,7 +33,7 @@ export function RawTagInspector({ isOpen, onClose }) {
       setError(null);
       
       const result = await invoke('inspect_file_tags', {
-        file_path: selected
+        filePath: selected
       });
       
       setTagData(result);
