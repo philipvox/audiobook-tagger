@@ -630,14 +630,12 @@ async fn update_abs_item(
         });
     }
 
-    let status = response.status();
-
     let body: UpdateMediaResponse = response
         .json()
         .await
         .map_err(|e| PushError {
             reason: format!("Failed to parse AudiobookShelf response: {}", e),
-            status: Some(status.as_u16()),
+            status: Some(response.status().as_u16()),
         })?;
 
     Ok(body.updated)
