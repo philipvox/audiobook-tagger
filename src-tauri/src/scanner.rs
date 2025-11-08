@@ -76,7 +76,7 @@ pub struct BookMetadata {
 pub async fn scan_directory(
     dir_path: &str, 
     api_key: Option<String>,
-    skip_unchanged: bool,
+    _skip_unchanged: bool,
     progress_callback: Option<Box<dyn Fn(crate::progress::ScanProgress) + Send + Sync>>
 ) -> Result<Vec<BookGroup>> {
     println!("🔍 SCAN STARTED");
@@ -89,7 +89,7 @@ pub async fn scan_directory(
         return Ok(vec![]);
     }
     
-    let groups = process_groups_with_gpt(files, api_key, skip_unchanged, progress_callback).await;
+    let groups = process_groups_with_gpt(files, api_key, _skip_unchanged, progress_callback).await;
     
     let total_changes: usize = groups.iter().map(|g| g.total_changes).sum();
     println!("✅ Complete: {} files in {} groups, {} changes", 
@@ -173,7 +173,7 @@ fn extract_tags(path: &Path) -> FileTags {
 async fn process_groups_with_gpt(
     files: Vec<RawFileData>, 
     api_key: Option<String>,
-    skip_unchanged: bool,
+    _skip_unchanged: bool,
     progress_callback: Option<Box<dyn Fn(crate::progress::ScanProgress) + Send + Sync>>
 ) -> Vec<BookGroup> {
     let total_files = files.len();
@@ -468,7 +468,7 @@ async fn process_groups_with_gpt(
         
         let (audible_data, google_data) = if let Some(ref cache_db) = cache {
             // This shouldn't happen since we checked cache above, but keeping for safety
-            if let Some(cached) = cache_db.get(&book_title, &book_author) {
+            if let Some(_cached) = cache_db.get(&book_title, &book_author) {
                 println!("   💾 Using cached metadata");
                 // This case is now handled above, but keeping fallback
                 (None, None)
