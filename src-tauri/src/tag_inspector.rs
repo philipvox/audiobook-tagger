@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lofty::file::AudioFile;
+use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, ItemValue};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,8 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
     let sample_rate = properties.sample_rate();
 
     let mut tags = Vec::new();
+
+    let primary_tag = tagged_file.primary_tag();
 
     // Get all tags from the file
     if let Some(tag) = primary_tag {
@@ -189,21 +191,15 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
 fn item_value_to_string(value: &ItemValue) -> Option<String> {
     match value {
         ItemValue::Text(text) => Some(text.to_string()),
-        ItemValue::Locator(locator) => Some(format!("{:?}", locator)),
+        ItemValue::Locator(locator) => Some(locator.to_string()),
         ItemValue::Binary(binary) => {
-            let bytes = binary.as_ref();
+            let bytes: &[u8] = binary.as_ref();
+
             if bytes.is_empty() {
                 None
             } else {
                 Some(format!("<binary data: {} bytes>", bytes.len()))
             }
         }
-        ItemValue::Unknown(data) => Some(format!("{:?}", data)),
-        ItemValue::Int(value) => Some(value.to_string()),
-        ItemValue::Unsigned(value) => Some(value.to_string()),
-        ItemValue::Bool(value) => Some(value.to_string()),
-        ItemValue::Date(date) => Some(format!("{:?}", date)),
-        ItemValue::Float(value) => Some(value.to_string()),
-        ItemValue::Rational(value) => Some(format!("{:?}", value)),
     }
 }
