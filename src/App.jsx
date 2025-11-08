@@ -358,7 +358,7 @@ function App() {
               onClick={() => setShowTagInspector(true)}
               className="btn btn-secondary flex items-center gap-2"
             >
-              <FileSearch, AlertCircle, Zap className="w-4 h-4" />
+              <FileSearch className="w-4 h-4" />
               Inspect Tags
             </button>
           </div>
