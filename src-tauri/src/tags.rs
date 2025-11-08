@@ -30,6 +30,11 @@ pub async fn write_file_tags(
         anyhow::bail!("File does not exist: {}", file_path);
     }
     
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() == 0 {
+        anyhow::bail!("File is empty (0 bytes)");
+    }
+    
     if backup {
         let backup_path = path.with_extension(
             format!("{}.backup", path.extension().unwrap_or_default().to_string_lossy())
@@ -40,17 +45,28 @@ pub async fn write_file_tags(
     
     println!("📝 Writing tags to: {}", file_path);
     
-    let mut tagged_file = Probe::open(path)
-        .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?
-        .read()
-        .map_err(|e| anyhow::anyhow!("Failed to read file tags: {}", e))?;
+    let mut tagged_file = match Probe::open(path) {
+        Ok(probe) => probe,
+        Err(e) => anyhow::bail!("Cannot open file (may be corrupted): {}", e),
+    };
     
-    let tag = if let Some(t) = tagged_file.primary_tag_mut() {
+    let mut file_content = match tagged_file.read() {
+        Ok(content) => content,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("fill whole buffer") || err_str.contains("UnexpectedEof") {
+                anyhow::bail!("File appears corrupted or has invalid tags. Try re-encoding this file or removing existing tags first.");
+            }
+            anyhow::bail!("Failed to read file tags: {}", e);
+        }
+    };
+    
+    let tag = if let Some(t) = file_content.primary_tag_mut() {
         t
     } else {
-        let tag_type = tagged_file.primary_tag_type();
-        tagged_file.insert_tag(Tag::new(tag_type));
-        tagged_file.primary_tag_mut().unwrap()
+        let tag_type = file_content.primary_tag_type();
+        file_content.insert_tag(Tag::new(tag_type));
+        file_content.primary_tag_mut().unwrap()
     };
     
     for (field, change) in changes {
@@ -121,7 +137,7 @@ pub async fn write_file_tags(
     
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     
-    tagged_file.save_to_path(path, lofty::config::WriteOptions::default())
+    file_content.save_to_path(path, lofty::config::WriteOptions::default())
         .map_err(|e| anyhow::anyhow!("Failed to save tags: {}", e))?;
     
     println!("✅ Saved tags to: {}", file_path);
