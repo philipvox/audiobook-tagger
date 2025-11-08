@@ -121,10 +121,15 @@ async fn write_tags(request: WriteRequest) -> Result<tags::WriteResult, String> 
     let mut errors = Vec::new();
     
     for file_id in &request.file_ids {
+        println!("🔄 Processing file ID: {}", file_id);
         if let Some(file_data) = request.files.get(file_id) {
             match tags::write_file_tags(&file_data.path, &file_data.changes, request.backup).await {
-                Ok(_) => success += 1,
+                Ok(_) => {
+                    println!("✅ SUCCESS for file_id: {}", file_id);
+                    success += 1;
+                }
                 Err(e) => {
+                    println!("❌ FAILED: {} - Error: {}", file_id, e);
                     failed += 1;
                     errors.push(tags::WriteError {
                         file_id: file_id.clone(),
