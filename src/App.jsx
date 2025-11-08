@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { FileAudio, RefreshCw, Wrench, Settings, Upload, Save, ChevronRight, ChevronDown, Folder, Book, Files, Clock, Zap, FileSearch } from 'lucide-react';
+import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, Clock, Zap, FileSearch } from 'lucide-react';
 import { RawTagInspector } from './components/RawTagInspector';
 
 function App() {
@@ -10,20 +10,22 @@ function App() {
   const [groups, setGroups] = useState([]);
   const [expandedGroups, setExpandedGroups] = useState(new Set());
   const [scanning, setScanning] = useState(false);
-  const [scanProgress, setScanProgress] = useState({ 
-    processed: 0, 
-    total: 0, 
+  const [scanProgress, setScanProgress] = useState({
+    processed: 0,
+    total: 0,
     current_file: '',
     files_per_second: 0,
     estimated_remaining_seconds: 0,
     cached_hits: 0
   });
   const [writing, setWriting] = useState(false);
+  const [pushing, setPushing] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState(new Set());
   const [selectedGroup, setSelectedGroup] = useState(null);
   const [selectedGroups, setSelectedGroups] = useState([]);
   const [scanStartTime, setScanStartTime] = useState(null);
   const [showTagInspector, setShowTagInspector] = useState(false);
+  const [lastWrittenItems, setLastWrittenItems] = useState([]);
 
   useEffect(() => {
     loadConfig();
@@ -57,6 +59,7 @@ function App() {
 
   const handleScan = async () => {
     try {
+      setLastWrittenItems([]);
       const selected = await open({
         directory: true,
         multiple: true,
@@ -98,11 +101,13 @@ function App() {
       alert('No files selected');
       return;
     }
-    
+
     try {
       setWriting(true);
-      
+
       const filesMap = {};
+      const selectedIds = Array.from(selectedFiles);
+      const recentItems = collectItemsForFileIds(selectedIds);
       groups.forEach(group => {
         group.files.forEach(file => {
           filesMap[file.id] = {
@@ -127,6 +132,7 @@ function App() {
       } else {
         alert(`Successfully wrote tags to ${result.success} files!`);
         setSelectedFiles(new Set());
+        setLastWrittenItems(recentItems);
       }
     } catch (error) {
       console.error('Write failed:', error);
@@ -147,7 +153,8 @@ function App() {
       const selectedGroupObjects = groups.filter(g => selectedGroups.includes(g.id));
       const allFileIds = [];
       const filesMap = {};
-      
+      const recentItems = [];
+
       selectedGroupObjects.forEach(group => {
         group.files.forEach(file => {
           allFileIds.push(file.id);
@@ -155,10 +162,13 @@ function App() {
             path: file.path,
             changes: file.changes
           };
+          if (!recentItems.find(item => item.path === file.path)) {
+            recentItems.push({ path: file.path, metadata: group.metadata });
+          }
         });
       });
-      
-      const result = await invoke('write_tags', { 
+
+      const result = await invoke('write_tags', {
         request: {
           file_ids: allFileIds,
           files: filesMap,
@@ -173,11 +183,85 @@ function App() {
       } else {
         alert(`Successfully wrote tags to ${result.success} files across ${selectedGroups.length} groups!`);
         setSelectedGroups([]);
+        setLastWrittenItems(recentItems);
       }
     } catch (error) {
       console.error('Write failed:', error);
       setWriting(false);
       alert('Write failed: ' + error);
+    }
+  };
+
+  const collectItemsForFileIds = (fileIds) => {
+    const idSet = new Set(fileIds);
+    const seenPaths = new Set();
+    const items = [];
+
+    groups.forEach(group => {
+      group.files.forEach(file => {
+        if (idSet.has(file.id) && !seenPaths.has(file.path)) {
+          seenPaths.add(file.path);
+          items.push({ path: file.path, metadata: group.metadata });
+        }
+      });
+    });
+
+    return items;
+  };
+
+  const isAbsConfigured = () => {
+    return (
+      config &&
+      config.abs_base_url &&
+      config.abs_base_url.trim() !== '' &&
+      config.abs_api_token &&
+      config.abs_api_token.trim() !== '' &&
+      config.abs_library_id &&
+      config.abs_library_id.trim() !== ''
+    );
+  };
+
+  const handlePushToAudiobookShelf = async () => {
+    if (!isAbsConfigured()) {
+      alert('Please configure AudiobookShelf connection in Settings before pushing updates.');
+      return;
+    }
+
+    if (lastWrittenItems.length === 0) {
+      alert('No recent tag updates found to push.');
+      return;
+    }
+
+    try {
+      setPushing(true);
+      const result = await invoke('push_abs_updates', {
+        request: {
+          items: lastWrittenItems
+        }
+      });
+      setPushing(false);
+
+      let message = `Updated ${result.updated || 0} item${result.updated === 1 ? '' : 's'} in AudiobookShelf.`;
+
+      if (result.unmatched && result.unmatched.length > 0) {
+        message += `\nCould not find matches for: ${result.unmatched.slice(0, 5).join(', ')}${
+          result.unmatched.length > 5 ? '…' : ''
+        }`;
+      }
+
+      if (result.failed && result.failed.length > 0) {
+        const failures = result.failed
+          .slice(0, 5)
+          .map((f) => `${f.path}${f.reason ? ` (${f.reason})` : ''}`)
+          .join(', ');
+        message += `\nFailed to update: ${failures}${result.failed.length > 5 ? '…' : ''}`;
+      }
+
+      alert(message);
+    } catch (error) {
+      console.error('Push to AudiobookShelf failed:', error);
+      setPushing(false);
+      alert('Failed to push updates: ' + error);
     }
   };
 
@@ -257,6 +341,16 @@ function App() {
               <button onClick={handleWrite} disabled={writing} className="btn btn-primary flex items-center gap-2">
                 <Save className="w-4 h-4" />
                 {writing ? 'Writing...' : `Write ${selectedFiles.size} Files`}
+              </button>
+            )}
+            {isAbsConfigured() && lastWrittenItems.length > 0 && (
+              <button
+                onClick={handlePushToAudiobookShelf}
+                disabled={pushing}
+                className="btn btn-primary flex items-center gap-2"
+              >
+                <UploadCloud className={`w-4 h-4 ${pushing ? 'animate-pulse' : ''}`} />
+                {pushing ? 'Pushing…' : 'Push to AudiobookShelf'}
               </button>
             )}
             <button
