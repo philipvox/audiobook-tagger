@@ -1,7 +1,7 @@
 use anyhow::Result;
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::AudioFile;
 use lofty::probe::Probe;
-use lofty::tag::{Accessor, ItemKey, ItemValue, Tag};
+use lofty::tag::{Accessor, ItemKey, ItemValue};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -42,11 +42,9 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
     let sample_rate = properties.sample_rate();
 
     let mut tags = Vec::new();
-    let mut primary_tag_ptr: Option<*const Tag> = None;
 
     // Get all tags from the file
-    if let Some(tag) = tagged_file.primary_tag() {
-        primary_tag_ptr = Some(tag as *const Tag);
+    if let Some(tag) = primary_tag {
         let tag_type = format!("{:?}", tag.tag_type());
 
         // Standard fields
@@ -156,7 +154,7 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
 
     // Check other tag types too
     for tag in tagged_file.tags() {
-        if primary_tag_ptr.map_or(false, |ptr| ptr == tag as *const Tag) {
+        if Some(tag) == primary_tag {
             continue; // Already processed
         }
 
@@ -191,15 +189,21 @@ pub fn inspect_file_tags(file_path: &str) -> Result<RawTags> {
 fn item_value_to_string(value: &ItemValue) -> Option<String> {
     match value {
         ItemValue::Text(text) => Some(text.to_string()),
-        ItemValue::Locator(locator) => Some(locator.to_string()),
+        ItemValue::Locator(locator) => Some(format!("{:?}", locator)),
         ItemValue::Binary(binary) => {
-            let bytes: &[u8] = binary.as_ref();
-
+            let bytes = binary.as_ref();
             if bytes.is_empty() {
                 None
             } else {
                 Some(format!("<binary data: {} bytes>", bytes.len()))
             }
         }
+        ItemValue::Unknown(data) => Some(format!("{:?}", data)),
+        ItemValue::Int(value) => Some(value.to_string()),
+        ItemValue::Unsigned(value) => Some(value.to_string()),
+        ItemValue::Bool(value) => Some(value.to_string()),
+        ItemValue::Date(date) => Some(format!("{:?}", date)),
+        ItemValue::Float(value) => Some(value.to_string()),
+        ItemValue::Rational(value) => Some(format!("{:?}", value)),
     }
 }
