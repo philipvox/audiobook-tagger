@@ -25,6 +25,7 @@ function App() {
   const [selectedGroups, setSelectedGroups] = useState([]);
   const [scanStartTime, setScanStartTime] = useState(null);
   const [showTagInspector, setShowTagInspector] = useState(false);
+  const [fileStatus, setFileStatus] = useState({});
   const [refreshing, setRefreshing] = useState(false);
   const [showRefreshOptions, setShowRefreshOptions] = useState(false);  const [lastWrittenItems, setLastWrittenItems] = useState([]);
 
@@ -140,6 +141,61 @@ function App() {
       setWriting(false);
       alert('Write failed: ' + error);
     }
+
+    const newStatus = { ...fileStatus };
+    const filesMap = {};
+    groups.forEach(group => {
+      group.files.forEach(file => {
+        filesMap[file.id] = {
+          path: file.path,
+          changes: file.changes
+        };
+      });
+    });
+
+    for (const fileId of Array.from(selectedFiles)) {
+      const fileData = filesMap[fileId];
+      if (!fileData) continue;
+
+      try {
+        await invoke('write_tags', {
+          request: {
+            file_ids: [fileId],
+            files: { [fileId]: fileData },
+            backup: config.backup_tags
+          }
+        });
+        newStatus[fileData.path] = 'success';
+      } catch (error) {
+        console.error(`Failed to write ${fileData.path}:`, error);
+        newStatus[fileData.path] = 'failed';
+      }
+    }
+
+    setFileStatus(newStatus);
+    setWriting(false);
+
+    const successCount = Object.values(newStatus).filter(s => s === 'success').length;
+    const failCount = Object.values(newStatus).filter(s => s === 'failed').length;
+
+    if (failCount > 0) {
+      alert(`Written: ${successCount} files\nFailed: ${failCount} files`);
+    } else {
+      alert(`Successfully wrote tags to ${successCount} files!`);
+    }
+
+    setSelectedFiles(new Set());
+    const recentItems = [];
+    for (const fileId of Array.from(selectedFiles)) {
+      const group = groups.find(g => g.files.some(f => f.id === fileId));
+      if (group) {
+        const file = group.files.find(f => f.id === fileId);
+        if (file && newStatus[file.path] === 'success') {
+          recentItems.push({ path: file.path, metadata: group.metadata });
+        }
+      }
+    }
+    setLastWrittenItems(recentItems);
   };
 
   const handleWriteGroups = async () => {
@@ -228,9 +284,12 @@ function App() {
       return;
     }
 
-    if (lastWrittenItems.length === 0) {
-      alert('No recent tag updates found to push.');
+    const successfulItems = lastWrittenItems.filter(item => fileStatus[item.path] === 'success');
+
+    if (successfulItems.length === 0) {
+      alert('No successfully written files to push.');
       return;
+    }
     }
 
     try {
