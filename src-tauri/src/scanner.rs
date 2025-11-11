@@ -285,14 +285,15 @@ async fn process_groups_with_gpt(
                     .await.ok().flatten();
                 
                 println!("      🤖 Step 4: GPT merges all sources...");
-                let final_metadata = merge_all_with_gpt(
+                let final_metadata = merge_all_with_gpt_retry(
                     &[file.clone()],
                     &book_name,
                     &book_title,
                     &book_author,
                     google_data,
                     audible_data,
-                    api_key.as_deref()
+                    api_key.as_deref(),
+                    3
                 ).await;
                 
                 let mut changes = HashMap::new();
@@ -512,14 +513,15 @@ async fn process_groups_with_gpt(
         };
         
         println!("   🤖 Step 4: GPT merges all sources...");
-        let final_metadata = merge_all_with_gpt(
+        let final_metadata = merge_all_with_gpt_retry(
             &folder_files,
             &folder_name,
             &book_title,
             &book_author,
             google_data,
             audible_data,
-            api_key.as_deref()
+            api_key.as_deref(),
+            3
         ).await;
         
         // Store FINAL metadata in cache for next time
@@ -997,4 +999,96 @@ fn detect_group_type(files: &[RawFileData]) -> GroupType {
     }
     
     GroupType::Chapters
+}
+// ============================================================================
+// RETRY LOGIC WITH QUALITY VALIDATION
+// ============================================================================
+
+async fn merge_all_with_gpt_retry(
+    files: &[RawFileData],
+    folder_name: &str,
+    extracted_title: &str,
+    extracted_author: &str,
+    google_data: Option<crate::metadata::BookMetadata>,
+    audible_data: Option<crate::audible::AudibleMetadata>,
+    api_key: Option<&str>,
+    max_retries: u32,
+) -> BookMetadata {
+    for attempt in 1..=max_retries {
+        if attempt > 1 {
+            println!("   🔄 Retry attempt {}/{}", attempt, max_retries);
+        }
+        
+        let metadata = merge_all_with_gpt(
+            files,
+            folder_name,
+            extracted_title,
+            extracted_author,
+            google_data.clone(),
+            audible_data.clone(),
+            api_key
+        ).await;
+        
+        let quality_score = validate_metadata_quality(&metadata, extracted_title, &audible_data);
+        
+        if quality_score >= 80 {
+            println!("   ✅ Quality: {}% - PASSED", quality_score);
+            return metadata;
+        } else {
+            println!("   ⚠️  Quality: {}% - RETRY", quality_score);
+        }
+    }
+    
+    println!("   ⚠️  All retries exhausted, using last result");
+    merge_all_with_gpt(files, folder_name, extracted_title, extracted_author, google_data, audible_data, api_key).await
+}
+
+fn validate_metadata_quality(
+    metadata: &BookMetadata,
+    extracted_title: &str,
+    audible_data: &Option<crate::audible::AudibleMetadata>,
+) -> u32 {
+    let mut score = 0;
+    
+    // Title must include the extracted title (e.g., "Dinosaurs Before Dark")
+    if metadata.title.contains(extracted_title) {
+        score += 30;
+    } else {
+        println!("      ❌ Title doesn't contain '{}'", extracted_title);
+    }
+    
+    // Narrator must exist if Audible has it
+    if let Some(aud) = audible_data {
+        if !aud.narrators.is_empty() {
+            if metadata.narrator.is_some() {
+                score += 20;
+            } else {
+                println!("      ❌ Missing narrator (Audible has: {:?})", aud.narrators);
+            }
+        }
+    }
+    
+    // Description should exist and be substantial
+    if let Some(ref desc) = metadata.description {
+        if desc.len() >= 100 && desc.len() <= 1000 {
+            score += 20;
+        }
+    }
+    
+    // Genres should be valid
+    if !metadata.genres.is_empty() && metadata.genres.len() <= 3 {
+        score += 15;
+    }
+    
+    // Series/sequence should match if present
+    if metadata.series.is_some() && metadata.sequence.is_some() {
+        score += 10;
+    }
+    
+    // Has publication info
+    if metadata.publisher.is_some() || metadata.year.is_some() {
+        score += 5;
+    }
+    
+    score
 }
