@@ -113,12 +113,16 @@ fn is_already_processed(tags: &FileTags) -> bool {
     
     is_processed
 }
+// src-tauri/src/scanner.rs - Replace the scan_directory function
 pub async fn scan_directory(
     dir_path: &str, 
     api_key: Option<String>,
     _skip_unchanged: bool,
     progress_callback: Option<Box<dyn Fn(crate::progress::ScanProgress) + Send + Sync>>
 ) -> Result<Vec<BookGroup>> {
+    // CRITICAL: Reset cancellation flag at start
+    set_cancellation_flag(false);
+    
     println!("🔍 SCAN STARTED");
     println!("📂 Collecting files...");
     
