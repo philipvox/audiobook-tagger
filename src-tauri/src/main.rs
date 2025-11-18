@@ -9,13 +9,87 @@ mod metadata;
 mod processor;
 mod audible;
 mod cache;
-mod progress;
+mod progress;  // ADD THIS LINE
 mod tag_inspector;
 mod audible_auth;
+mod file_rename;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RenamePreview {
+    old_path: String,
+    new_path: String,
+    changed: bool,
+}
+
+#[tauri::command]
+async fn preview_rename(
+    file_path: String,
+    metadata: scanner::BookMetadata,
+) -> Result<RenamePreview, String> {
+    use std::path::Path;
+    
+    let path = Path::new(&file_path);
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("m4b");
+    
+    let new_filename = file_rename::generate_filename(&file_rename::BookMetadata {
+        title: metadata.title.clone(),
+        author: metadata.author.clone(),
+        series: metadata.series.clone(),
+        sequence: metadata.sequence.clone(),
+        year: metadata.year.clone(),
+    }, ext);
+    
+    let new_path = path.with_file_name(&new_filename);
+    
+    Ok(RenamePreview {
+        old_path: file_path.clone(),
+        new_path: new_path.to_string_lossy().to_string(),
+        changed: file_path != new_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+async fn rename_files(
+    files: Vec<(String, scanner::BookMetadata)>,
+) -> Result<Vec<RenamePreview>, String> {
+    let mut results = Vec::new();
+    
+    for (file_path, metadata) in files {
+        let rename_meta = file_rename::BookMetadata {
+            title: metadata.title.clone(),
+            author: metadata.author.clone(),
+            series: metadata.series.clone(),
+            sequence: metadata.sequence.clone(),
+            year: metadata.year.clone(),
+        };
+        
+        match file_rename::rename_and_reorganize_file(
+            &file_path,
+            &rename_meta,
+            false,
+            None,
+        ).await {
+            Ok(result) => {
+                results.push(RenamePreview {
+                    old_path: result.old_path,
+                    new_path: result.new_path,
+                    changed: result.success,
+                });
+            }
+            Err(e) => {
+                return Err(format!("Failed to rename {}: {}", file_path, e));
+            }
+        }
+    }
+    
+    Ok(results)
+}
 
 #[tauri::command]
 fn get_config() -> config::Config {
@@ -265,7 +339,12 @@ struct ItemMetadata {
 struct LibraryItemsResponse {
     results: Vec<LibraryItem>,
 }
-
+#[tauri::command]
+async fn cancel_scan() -> Result<(), String> {
+    // Set a global cancellation flag
+    crate::scanner::set_cancellation_flag(true);
+    Ok(())
+}
 #[tauri::command]
 async fn clear_all_genres() -> Result<String, String> {
     let config = config::load_config().map_err(|e| e.to_string())?;
@@ -608,7 +687,14 @@ async fn login_to_audible(email: String, password: String, country_code: String)
 async fn check_audible_installed() -> Result<bool, String> {
     audible_auth::check_audible_status().map_err(|e| e.to_string())
 }
-
+#[tauri::command]
+async fn get_scan_progress() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "current": crate::progress::get_current_progress(),
+        "total": crate::progress::get_total_files(),
+        "current_file": crate::progress::get_current_file()
+    }))
+}
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -630,107 +716,10 @@ fn main() {
             inspect_file_tags,
             preview_rename,
             rename_files,
+            get_scan_progress,
+            cancel_scan,
+
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[derive(Debug, Serialize)]
-struct RenamePreview {
-    old_path: String,
-    new_path: String,
-    changed: bool,
-}
-
-#[tauri::command]
-async fn preview_rename(
-    file_path: String,
-    metadata: scanner::BookMetadata,
-) -> Result<RenamePreview, String> {
-    use std::path::Path;
-    
-    let path = Path::new(&file_path);
-    let ext = path.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("m4b");
-    
-    let new_filename = generate_filename(&metadata, ext);
-    let new_path = path.with_file_name(&new_filename);
-    
-    Ok(RenamePreview {
-        old_path: file_path.clone(),
-        new_path: new_path.to_string_lossy().to_string(),
-        changed: file_path != new_path.to_string_lossy().to_string(),
-    })
-}
-
-#[tauri::command]
-async fn rename_files(
-    files: Vec<(String, scanner::BookMetadata)>,
-) -> Result<Vec<RenamePreview>, String> {
-    let mut results = Vec::new();
-    
-    for (file_path, metadata) in files {
-        match std::fs::rename(&file_path, &generate_new_path(&file_path, &metadata)) {
-            Ok(_) => {
-                let new_path = generate_new_path(&file_path, &metadata);
-                results.push(RenamePreview {
-                    old_path: file_path,
-                    new_path: new_path.clone(),
-                    changed: true,
-                });
-            }
-            Err(e) => {
-                return Err(format!("Failed to rename {}: {}", file_path, e));
-            }
-        }
-    }
-    
-    Ok(results)
-}
-
-fn generate_filename(metadata: &scanner::BookMetadata, ext: &str) -> String {
-    let mut parts = Vec::new();
-    
-    // Author
-    parts.push(sanitize_filename(&metadata.author));
-    
-    // Series [Name #N]
-    if let Some(ref series) = metadata.series {
-        let series_part = if let Some(ref seq) = metadata.sequence {
-            format!("[{} #{}]", sanitize_filename(series), seq)
-        } else {
-            format!("[{}]", sanitize_filename(series))
-        };
-        parts.push(series_part);
-    }
-    
-    // Title
-    parts.push(sanitize_filename(&metadata.title));
-    
-    // (Year)
-    if let Some(ref year) = metadata.year {
-        parts.push(format!("({})", year));
-    }
-    
-    format!("{}.{}", parts.join(" - "), ext)
-}
-
-fn generate_new_path(old_path: &str, metadata: &scanner::BookMetadata) -> String {
-    use std::path::Path;
-    let path = Path::new(old_path);
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("m4b");
-    let new_filename = generate_filename(metadata, ext);
-    path.with_file_name(&new_filename).to_string_lossy().to_string()
-}
-
-fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
 }

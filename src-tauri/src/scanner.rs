@@ -4,7 +4,17 @@ use serde::{Serialize, Deserialize};
 use anyhow::Result;
 
 use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+static CANCELLATION_FLAG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_cancellation_flag(cancelled: bool) {
+    CANCELLATION_FLAG.store(cancelled, Ordering::Relaxed);
+}
+
+pub fn is_cancelled() -> bool {
+    CANCELLATION_FLAG.load(Ordering::Relaxed)
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawFileData {
     pub id: String,
@@ -73,6 +83,36 @@ pub struct BookMetadata {
     pub isbn: Option<String>,
 }
 
+fn is_already_processed(tags: &FileTags) -> bool {
+    // Check if tags match our app's output format
+    let has_narrator_format = tags.comment.as_ref()
+        .map(|c| c.contains("Narrated by ") || c.contains("Read by "))
+        .unwrap_or(false);
+    
+    let has_clean_genres = tags.genre.as_ref()
+        .map(|g| {
+            // Check if it's our comma-separated format with approved genres
+            let genre_parts: Vec<&str> = g.split(',').map(|s| s.trim()).collect();
+            genre_parts.len() >= 1 && genre_parts.len() <= 3 && 
+            genre_parts.iter().any(|&genre| crate::genres::APPROVED_GENRES.contains(&genre))
+        })
+        .unwrap_or(false);
+    
+    let has_clean_title = tags.title.as_ref()
+        .map(|t| !t.contains("(Unabridged)") && !t.contains("[Retail]") && !t.contains("320kbps") && !t.contains("Track "))
+        .unwrap_or(false);
+    
+    println!("🔍 Already processed check:");
+    println!("   Narrator format: {} (comment: {:?})", has_narrator_format, tags.comment);
+    println!("   Clean genres: {} (genre: {:?})", has_clean_genres, tags.genre);
+    println!("   Clean title: {} (title: {:?})", has_clean_title, tags.title);
+    
+    // File is considered "already processed" if it has our narrator format AND clean genres
+    let is_processed = has_narrator_format && has_clean_genres;
+    println!("   RESULT: {}", if is_processed { "SKIP PROCESSING" } else { "NEEDS PROCESSING" });
+    
+    is_processed
+}
 pub async fn scan_directory(
     dir_path: &str, 
     api_key: Option<String>,
@@ -176,8 +216,13 @@ async fn process_groups_with_gpt(
     _skip_unchanged: bool,
     progress_callback: Option<Box<dyn Fn(crate::progress::ScanProgress) + Send + Sync>>
 ) -> Vec<BookGroup> {
+    set_cancellation_flag(false);
+    
     let total_files = files.len();
     let start_time = Instant::now();
+    
+    // ADD THIS LINE:
+    crate::progress::set_total_files(total_files);
     
     let config = crate::config::load_config().ok();
     let max_workers = config.as_ref().map(|c| c.max_workers).unwrap_or(10);
@@ -200,7 +245,10 @@ async fn process_groups_with_gpt(
                 parent = format!("{})", &parent[..pos]);
             }
         }
-        
+        if is_cancelled() {
+            println!("🛑 Scan cancelled by user");
+            break;
+        }
         let _filename_lower = file.filename.to_lowercase();
         let parent_lower = parent.to_lowercase();
         
@@ -237,6 +285,14 @@ async fn process_groups_with_gpt(
     let mut processed = 0;
     
     for (folder_name, mut folder_files) in folder_map {
+        if is_cancelled() {
+            println!("🛑 Scan cancelled by user");
+            break;
+        }
+        crate::progress::increment_progress(&folder_name);
+        
+        println!("📁 Processing group: {} [{}]", folder_name, folder_files[0].id);
+        // ... rest of the existing code
         processed += 1;
         progress.update(processed, &folder_name, start_time, false);
         if let Some(ref callback) = progress_callback {
@@ -254,6 +310,10 @@ async fn process_groups_with_gpt(
             println!("   📚 Series detected - processing each book separately");
             
             for file in folder_files {
+                 if is_cancelled() {
+                    println!("🛑 Scan cancelled by user - stopping series processing");
+                    break;
+                }
                 let book_name = file.filename.replace(".m4b", "").replace(".m4a", "").replace(".mp3", "");
                 
                 println!("\n   📖 Book: {}", book_name);
@@ -366,7 +426,6 @@ async fn process_groups_with_gpt(
         }
         
         let sample_file = &folder_files[0];
-        
         // OPTIMIZATION: Try cache FIRST before any GPT calls
         let cache = crate::cache::MetadataCache::new().ok();
         let config = crate::config::load_config().ok();
@@ -377,6 +436,67 @@ async fn process_groups_with_gpt(
         let quick_author = sample_file.tags.artist.as_deref()
             .or(sample_file.tags.album_artist.as_deref())
             .unwrap_or("Unknown");
+        
+        // NEW: Check if file was already processed by our app
+        let already_processed = is_already_processed(&sample_file.tags);
+        if already_processed {
+            println!("   ✅ File already processed by this app - using existing tags directly");
+            println!("   📋 Title: {:?}", sample_file.tags.title);
+            println!("   📋 Comment: {:?}", sample_file.tags.comment);
+            println!("   📋 Genre: {:?}", sample_file.tags.genre);
+        }
+        
+        if already_processed {
+            println!("   ✅ File already processed by this app - using existing tags directly");
+            
+            // Extract existing tags directly without GPT reprocessing
+            let final_metadata = BookMetadata {
+                title: sample_file.tags.title.clone().unwrap_or_else(|| folder_name.clone()),
+                subtitle: None,
+                author: sample_file.tags.artist.clone().unwrap_or_else(|| "Unknown".to_string()),
+                narrator: sample_file.tags.comment.as_ref()
+                    .and_then(|c| {
+                        if c.starts_with("Narrated by ") {
+                            Some(c.trim_start_matches("Narrated by ").to_string())
+                        } else if c.starts_with("Read by ") {
+                            Some(c.trim_start_matches("Read by ").to_string())
+                        } else {
+                            None
+                        }
+                    }),
+                series: None,
+                sequence: None,
+                genres: sample_file.tags.genre.as_ref()
+                    .map(|g| g.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default(),
+                publisher: None,
+                year: sample_file.tags.year.clone(),
+                description: None,
+                isbn: None,
+            };
+            
+            let audio_files: Vec<AudioFile> = folder_files.iter().map(|f| {
+                AudioFile {
+                    id: f.id.clone(),
+                    path: f.path.clone(),
+                    filename: f.filename.clone(),
+                    status: "unchanged".to_string(),
+                    changes: HashMap::new(),
+                }
+            }).collect();
+            
+            groups.push(BookGroup {
+                id: group_id.to_string(),
+                group_name: folder_name.clone(),
+                group_type,
+                files: audio_files,
+                metadata: final_metadata,
+                total_changes: 0,
+            });
+            
+            group_id += 1;
+            continue;
+        }
         
         // Check cache with quick lookup first
         if let Some(ref cache_db) = cache {
@@ -451,7 +571,7 @@ async fn process_groups_with_gpt(
                 });
                 
                 group_id += 1;
-                continue; // Skip all GPT processing for this group!
+                continue;
             }
         }
         
@@ -611,7 +731,6 @@ async fn process_groups_with_gpt(
     
     groups
 }
-
 async fn extract_book_info_with_gpt(
     sample_file: &RawFileData,
     folder_name: &str,
@@ -627,6 +746,12 @@ async fn extract_book_info_with_gpt(
         }
     };
     
+    // Clean our own formatting before sending to GPT
+    let clean_title = sample_file.tags.title.as_ref()
+        .map(|t| t.replace(" - Part 1", "").replace(" - Part 2", "").trim().to_string());
+    let clean_artist = sample_file.tags.artist.as_ref()
+        .map(|a| a.to_string());
+    
     let prompt = format!(
 r#"Extract the BOOK title and AUTHOR from these audiobook file tags. Ignore chapter/track numbers.
 
@@ -636,6 +761,10 @@ FILE TAGS:
 - Title: {:?}
 - Artist: {:?}
 - Album: {:?}
+
+IMPORTANT: These tags may have been cleaned already. Use them directly if they look clean.
+- If title is already clean (no track numbers, no junk), use it as-is
+- If artist is already clean, use it as-is
 
 The tags might be messy (e.g., "Track 10" or "Magic Tree House - #55 Night of the Ninth Dragon").
 
@@ -651,8 +780,8 @@ Return ONLY valid JSON:
 JSON:"#,
         folder_name,
         sample_file.filename,
-        sample_file.tags.title,
-        sample_file.tags.artist,
+        clean_title,
+        clean_artist,
         sample_file.tags.album
     );
     
@@ -685,7 +814,6 @@ JSON:"#,
         }
     }
 }
-
 async fn merge_all_with_gpt(
     files: &[RawFileData],
     folder_name: &str,
@@ -699,6 +827,21 @@ async fn merge_all_with_gpt(
         .filter_map(|f| f.tags.comment.clone())
         .collect();
     
+    // PRE-EXTRACT reliable year from sources (don't let GPT override this)
+    let reliable_year = audible_data.as_ref()
+        .and_then(|d| d.release_date.clone())
+        .and_then(|date| {
+            // Extract just the year from date strings like "2021-01-02"
+            date.split('-').next().map(|s| s.to_string())
+        })
+        .or_else(|| {
+            google_data.as_ref()
+                .and_then(|d| d.publish_date.clone())
+                .and_then(|date| {
+                    date.split('-').next().map(|s| s.to_string())
+                })
+        });
+    
     let google_summary = if let Some(ref data) = google_data {
         format!(
             "Title: {:?}, Authors: {:?}, Publisher: {:?}, Date: {:?}",
@@ -710,8 +853,8 @@ async fn merge_all_with_gpt(
     
     let audible_summary = if let Some(ref data) = audible_data {
         format!(
-            "Title: {:?}, Authors: {:?}, Narrators: {:?}, Series: {:?}, Publisher: {:?}, ASIN: {:?}",
-            data.title, data.authors, data.narrators, data.series, data.publisher, data.asin
+            "Title: {:?}, Authors: {:?}, Narrators: {:?}, Series: {:?}, Publisher: {:?}, Release Date: {:?}, ASIN: {:?}",
+            data.title, data.authors, data.narrators, data.series, data.publisher, data.release_date, data.asin
         )
     } else {
         "No data".to_string()
@@ -729,11 +872,17 @@ async fn merge_all_with_gpt(
                 sequence: None,
                 genres: vec![],
                 publisher: google_data.as_ref().and_then(|d| d.publisher.clone()),
-                year: google_data.as_ref().and_then(|d| d.publish_date.clone()),
+                year: reliable_year,
                 description: google_data.as_ref().and_then(|d| d.description.clone()),
                 isbn: None,
             };
         }
+    };
+    
+    let year_instruction = if let Some(ref year) = reliable_year {
+        format!("CRITICAL: Use EXACTLY this year: {} (from Audible/Google Books - DO NOT CHANGE)", year)
+    } else {
+        "year: If not found in sources, return null".to_string()
     };
     
     let prompt = format!(
@@ -763,7 +912,7 @@ OUTPUT ALL FIELDS:
 - sequence: Extract book number from filename (e.g., "01" or "02")
 - genres: Pick 1-3 from approved list
 - publisher: From Google Books or Audible
-- year: Publication year as string
+- {}
 - description: Brief description from Google/Audible
 - isbn: From Google Books
 
@@ -777,13 +926,19 @@ JSON:"#,
         google_summary,
         audible_summary,
         sample_comments,
-        crate::genres::APPROVED_GENRES.join(", ")
+        crate::genres::APPROVED_GENRES.join(", "),
+        year_instruction
     );
     
     match call_gpt_merge_metadata(&prompt, api_key).await {
         Ok(json_str) => {
             match serde_json::from_str::<BookMetadata>(&json_str) {
-                Ok(metadata) => {
+                Ok(mut metadata) => {
+                    // FORCE the reliable year back in (in case GPT changed it)
+                    if let Some(year) = reliable_year {
+                        metadata.year = Some(year);
+                    }
+                    
                     println!("   ✅ Final: title='{}', author='{}', narrator={:?}", 
                         metadata.title, metadata.author, metadata.narrator);
                     println!("            genres={:?}, publisher={:?}, year={:?}",
@@ -809,8 +964,7 @@ JSON:"#,
                             .unwrap_or_default(),
                         publisher: google_data.as_ref().and_then(|d| d.publisher.clone())
                             .or_else(|| audible_data.as_ref().and_then(|d| d.publisher.clone())),
-                        year: google_data.as_ref().and_then(|d| d.publish_date.clone())
-                            .or_else(|| audible_data.as_ref().and_then(|d| d.release_date.clone())),
+                        year: reliable_year,
                         description: google_data.as_ref().and_then(|d| d.description.clone())
                             .or_else(|| audible_data.as_ref().and_then(|d| d.description.clone())),
                         isbn: google_data.as_ref()
@@ -838,8 +992,7 @@ JSON:"#,
                     .unwrap_or_default(),
                 publisher: google_data.as_ref().and_then(|d| d.publisher.clone())
                     .or_else(|| audible_data.as_ref().and_then(|d| d.publisher.clone())),
-                year: google_data.as_ref().and_then(|d| d.publish_date.clone())
-                    .or_else(|| audible_data.as_ref().and_then(|d| d.release_date.clone())),
+                year: reliable_year,
                 description: google_data.as_ref().and_then(|d| d.description.clone())
                     .or_else(|| audible_data.as_ref().and_then(|d| d.description.clone())),
                 isbn: google_data.as_ref()

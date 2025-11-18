@@ -1,42 +1,73 @@
-use serde::Serialize;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use lazy_static::lazy_static;
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ScanProgress {
     pub current: usize,
     pub total: usize,
-    pub current_book: String,
-    pub elapsed_seconds: u64,
-    pub estimated_remaining_seconds: u64,
-    pub files_per_second: f64,
-    pub cached_hits: usize,
+    pub current_file: String,
 }
 
 impl ScanProgress {
     pub fn new(total: usize) -> Self {
-        Self {
+        ScanProgress {
             current: 0,
             total,
-            current_book: String::new(),
-            elapsed_seconds: 0,
-            estimated_remaining_seconds: 0,
-            files_per_second: 0.0,
-            cached_hits: 0,
+            current_file: String::new(),
         }
     }
     
-    pub fn update(&mut self, current: usize, book_name: &str, start_time: std::time::Instant, cached: bool) {
-        self.current = current;
-        self.current_book = book_name.to_string();
-        self.elapsed_seconds = start_time.elapsed().as_secs();
+    pub fn update(&mut self, processed: usize, current_file: &str, _start_time: Instant, _completed: bool) {
+        self.current = processed;
+        self.current_file = current_file.to_string();
         
-        if cached {
-            self.cached_hits += 1;
+        // Update the global progress state too
+        if let Ok(mut progress) = PROGRESS.lock() {
+            progress.current = processed;
+            progress.current_file = current_file.to_string();
         }
-        
-        if current > 0 {
-            self.files_per_second = current as f64 / start_time.elapsed().as_secs_f64();
-            let remaining = self.total - current;
-            self.estimated_remaining_seconds = (remaining as f64 / self.files_per_second) as u64;
-        }
+    }
+}
+
+lazy_static! {
+    static ref PROGRESS: Arc<Mutex<ScanProgress>> = Arc::new(Mutex::new(ScanProgress {
+        current: 0,
+        total: 0,
+        current_file: String::new(),
+    }));
+}
+
+pub fn set_total_files(total: usize) {
+    if let Ok(mut progress) = PROGRESS.lock() {
+        progress.total = total;
+        progress.current = 0;
+    }
+}
+
+pub fn increment_progress(current_file: &str) {
+    if let Ok(mut progress) = PROGRESS.lock() {
+        progress.current += 1;
+        progress.current_file = current_file.to_string();
+    }
+}
+
+pub fn get_current_progress() -> usize {
+    PROGRESS.lock().map(|p| p.current).unwrap_or(0)
+}
+
+pub fn get_total_files() -> usize {
+    PROGRESS.lock().map(|p| p.total).unwrap_or(0)
+}
+
+pub fn get_current_file() -> String {
+    PROGRESS.lock().map(|p| p.current_file.clone()).unwrap_or_default()
+}
+
+pub fn reset_progress() {
+    if let Ok(mut progress) = PROGRESS.lock() {
+        progress.current = 0;
+        progress.total = 0;
+        progress.current_file.clear();
     }
 }
