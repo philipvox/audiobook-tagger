@@ -1,14 +1,13 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-// import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, FileSearch, FileType } from 'lucide-react';
-// import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, FileSearch, FileType, AlertCircle } from 'lucide-react';
-// import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, FileSearch, FileType, AlertCircle, Zap } from 'lucide-react';
-import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, FileSearch, FileType, AlertCircle, Zap, CheckCircle } from 'lucide-react';
+import { FileAudio, RefreshCw, Wrench, Settings, Upload, UploadCloud, Save, ChevronRight, ChevronDown, Folder, Book, Files, FileSearch, FileType, AlertCircle, Zap, CheckCircle, Edit } from 'lucide-react';
 import { RawTagInspector } from './components/RawTagInspector';
 import { ConfirmModal } from './components/ConfirmModal';
 import { RenamePreviewModal } from './components/RenamePreviewModal';
 import { WritePreviewModal } from './components/WritePreviewModal';
+import { listen } from '@tauri-apps/api/event';
+import { EditMetadataModal } from './components/EditMetadataModal';
 
 function App() {
   const [activeTab, setActiveTab] = useState('scanner');
@@ -28,6 +27,9 @@ function App() {
   const [showWritePreview, setShowWritePreview] = useState(false);
   const [confirmModal, setConfirmModal] = useState(null);
   const [lastSelectedIndex, setLastSelectedIndex] = useState(null);
+  const [showEditModal, setShowEditModal] = useState(false);
+
+const [editingGroup, setEditingGroup] = useState(null);
   const [scanProgress, setScanProgress] = useState({
     current: 0,
     total: 0,
@@ -35,7 +37,95 @@ function App() {
     startTime: null,
     filesPerSecond: 0
   });
+  const [writeProgress, setWriteProgress] = useState({ current: 0, total: 0 });
+const handleEditMetadata = (group) => {
+  setEditingGroup(group);
+  setShowEditModal(true);
+};
 
+const handleSaveMetadata = (newMetadata) => {
+  if (!editingGroup) return;
+  
+  setGroups(prevGroups => 
+    prevGroups.map(group => {
+      if (group.id === editingGroup.id) {
+        // Update ALL files in the group with new metadata
+        const updatedFiles = group.files.map(file => {
+          const changes = {};
+          
+          // Get old values from existing changes, or keep them empty
+          const oldTitle = file.changes.title?.old || '';
+          const oldAuthor = file.changes.author?.old || '';
+          const oldNarrator = file.changes.narrator?.old || '';
+          const oldGenre = file.changes.genre?.old || '';
+          
+          // Title change
+          if (oldTitle !== newMetadata.title) {
+            changes.title = { old: oldTitle, new: newMetadata.title };
+          }
+          
+          // Author change
+          if (oldAuthor !== newMetadata.author) {
+            changes.author = { old: oldAuthor, new: newMetadata.author };
+          }
+          
+          // Narrator change
+          if (newMetadata.narrator) {
+            const newNarratorValue = `Narrated by ${newMetadata.narrator}`;
+            if (oldNarrator !== newNarratorValue) {
+              changes.narrator = { old: oldNarrator, new: newNarratorValue };
+            }
+          }
+          
+          // Genre change
+          if (newMetadata.genres.length > 0) {
+            const newGenre = newMetadata.genres.join(', ');
+            if (oldGenre !== newGenre) {
+              changes.genre = { old: oldGenre, new: newGenre };
+            }
+          }
+          
+          // Series and year (these go in comments/custom tags)
+          if (newMetadata.series) {
+            changes.series = { old: '', new: newMetadata.series };
+          }
+          
+          if (newMetadata.sequence) {
+            changes.sequence = { old: '', new: newMetadata.sequence };
+          }
+          
+          if (newMetadata.year) {
+            changes.year = { old: file.changes.year?.old || '', new: newMetadata.year };
+          }
+          
+          if (newMetadata.publisher) {
+            changes.publisher = { old: '', new: newMetadata.publisher };
+          }
+          
+          if (newMetadata.description) {
+            changes.description = { old: '', new: newMetadata.description };
+          }
+          
+          return {
+            ...file,
+            changes,
+            status: Object.keys(changes).length > 0 ? 'changed' : 'unchanged'
+          };
+        });
+        
+        return {
+          ...group,
+          metadata: newMetadata,
+          files: updatedFiles,
+          total_changes: updatedFiles.filter(f => Object.keys(f.changes).length > 0).length
+        };
+      }
+      return group;
+    })
+  );
+  
+  setEditingGroup(null);
+};
 const showConfirm = (config) => {
   setConfirmModal(config);
 };
@@ -46,6 +136,21 @@ const hideConfirm = () => {
 
   useEffect(() => {
     loadConfig();
+    
+    // Listen for write progress
+    const setupListener = async () => {
+      const unlisten = await listen('write_progress', (event) => {
+        setWriteProgress(event.payload);
+      });
+      return unlisten;
+    };
+    
+    let unlistenFn;
+    setupListener().then(fn => { unlistenFn = fn; });
+    
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
   }, []);
 
   const loadConfig = async () => {
@@ -386,10 +491,10 @@ const handleScan = async () => {
   // Show the preview modal instead of confirmation
   setShowWritePreview(true);
 };
-
 const performWrite = async () => {
   try {
     setWriting(true);
+    setWriteProgress({ current: 0, total: selectedFiles.size });  // ADD THIS
 
     const filesMap = {};
     groups.forEach(group => {
@@ -975,7 +1080,7 @@ const cancelScan = async () => {
                               }}
                               className="mt-1 w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
                             />
-                            
+
                             {/* Book Info */}
                             <div className="flex-1 min-w-0">
                               <div className="flex items-start justify-between mb-2">
@@ -1088,8 +1193,12 @@ const cancelScan = async () => {
                 </div>
               ) : (
                 <div className="p-6">
-                  <MetadataDisplay metadata={selectedGroup.metadata} groupInfo={selectedGroup} />
-                </div>
+                <MetadataDisplay 
+                  metadata={selectedGroup.metadata} 
+                  groupInfo={selectedGroup}
+                  onEdit={() => handleEditMetadata(selectedGroup)}
+                />
+              </div>
               )}
             </div>
           </div>
@@ -1140,10 +1249,8 @@ const cancelScan = async () => {
                   Cancel
                 </button>
                 <div className="text-sm text-gray-600">
-                  {scanProgress.filesPerSecond > 0 && 
-                    `${scanProgress.filesPerSecond.toFixed(1)} files/sec`
-                  }
-                </div>
+                    {scanProgress.total > 0 ? Math.round((scanProgress.current / scanProgress.total) * 100) : 0}% complete
+                  </div>
               </div>
               
               <div className="text-right">
@@ -1162,7 +1269,7 @@ const cancelScan = async () => {
                 <div 
                   className="bg-gradient-to-r from-blue-500 to-blue-600 h-3 rounded-full transition-all duration-300"
                   style={{ 
-                    width: `${Math.max(2, (scanProgress.current / scanProgress.total) * 100)}%` 
+                    width: `${scanProgress.total > 0 ? Math.max(2, (scanProgress.current / scanProgress.total) * 100) : 0}%` 
                   }}
                 ></div>
               </div>
@@ -1177,7 +1284,30 @@ const cancelScan = async () => {
           </div>
         </div>
       )}
-
+      {/* Write Progress Bar */}
+      {writing && writeProgress.total > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg z-50">
+          <div className="px-6 py-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Save className="w-5 h-5 text-blue-600 animate-pulse" />
+                <span className="font-semibold text-gray-900">
+                  Writing tags {writeProgress.current} of {writeProgress.total}
+                </span>
+              </div>
+              <div className="text-sm text-gray-600">
+                {Math.round((writeProgress.current / writeProgress.total) * 100)}% complete
+              </div>
+            </div>
+            <div className="w-full bg-gray-200 rounded-full h-3">
+              <div 
+                className="bg-blue-600 h-3 rounded-full transition-all duration-300"
+                style={{ width: `${writeProgress.total > 0 ? (writeProgress.current / writeProgress.total) * 100 : 0}%` }}
+              ></div>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Custom Confirmation Modal */}
       {confirmModal && (
         <ConfirmModal
@@ -1201,7 +1331,18 @@ const cancelScan = async () => {
           backupEnabled={config.backup_tags}
         />
       )}
-
+       {showEditModal && editingGroup && (
+        <EditMetadataModal
+          isOpen={showEditModal}
+          onClose={() => {
+            setShowEditModal(false);
+            setEditingGroup(null);
+          }}
+          onSave={handleSaveMetadata}
+          metadata={editingGroup.metadata}
+          groupName={editingGroup.group_name}
+        />
+      )}
       {/* Custom Confirmation Modal */}
       {confirmModal && (
         <ConfirmModal
@@ -1221,20 +1362,30 @@ const cancelScan = async () => {
 
 // Keep existing MetadataDisplay, MaintenanceTab, and SettingsTab components unchanged
 
-function MetadataDisplay({ metadata, groupInfo }) {
+function MetadataDisplay({ metadata, groupInfo, onEdit }) {
   const meta = metadata || {};
   
   return (
     <div className="bg-white rounded-xl shadow-sm p-8 space-y-8">
-      <div className="space-y-2">
-        <h1 className="text-3xl font-bold text-gray-900 leading-tight">
-          {meta.title || 'Untitled'}
-        </h1>
-        {meta.subtitle && (
-          <p className="text-lg text-gray-600">{meta.subtitle}</p>
+      <div className="flex items-start justify-between">
+        <div className="space-y-2 flex-1">
+          <h1 className="text-3xl font-bold text-gray-900 leading-tight">
+            {meta.title || 'Untitled'}
+          </h1>
+          {meta.subtitle && (
+            <p className="text-lg text-gray-600">{meta.subtitle}</p>
+          )}
+        </div>
+        {onEdit && (
+          <button
+            onClick={onEdit}
+            className="ml-4 px-4 py-2 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg transition-colors font-medium flex items-center gap-2"
+          >
+            <Edit className="w-4 h-4" />
+            Edit
+          </button>
         )}
       </div>
-
       <div className="flex items-center gap-6 text-sm pb-6 border-b border-gray-100">
         <div>
           <span className="text-gray-500">by </span>
