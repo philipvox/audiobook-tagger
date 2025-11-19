@@ -9,6 +9,7 @@ pub struct CachedMetadata {
     pub timestamp: u64,
 }
 
+#[derive(Clone)]
 pub struct MetadataCache {
     db: sled::Db,
 }

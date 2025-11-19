@@ -5,6 +5,8 @@ use anyhow::Result;
 
 use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Semaphore;
+use std::sync::Arc;
 
 static CANCELLATION_FLAG: AtomicBool = AtomicBool::new(false);
 
@@ -113,7 +115,6 @@ fn is_already_processed(tags: &FileTags) -> bool {
     
     is_processed
 }
-// src-tauri/src/scanner.rs - Replace the scan_directory function
 pub async fn scan_directory(
     dir_path: &str, 
     api_key: Option<String>,
@@ -144,6 +145,39 @@ pub async fn scan_directory(
     
     Ok(groups)
 }
+// pub async fn scan_directory_streaming<F>(
+//     dir_path: &str,
+//     api_key: Option<String>,
+//     skip_unchanged: bool,
+//     mut callback: F,
+// ) -> Result<Vec<BookGroup>>
+// where
+//     F: FnMut(Vec<BookGroup>) + Send + 'static,
+// {
+//     let files = collect_audio_files(dir_path)?;
+    
+//     // Process in batches of 50 books
+//     let batch_size = 50;
+//     let mut all_groups = Vec::new();
+    
+//     for chunk in files.chunks(batch_size) {
+//         if is_cancelled() {
+//             break;
+//         }
+        
+//         let batch_groups = process_groups_with_gpt(
+//             chunk.to_vec(),
+//             api_key.clone(),
+//             skip_unchanged,
+//             None
+//         ).await;
+        
+//         callback(batch_groups.clone());
+//         all_groups.extend(batch_groups);
+//     }
+    
+//     Ok(all_groups)
+// }
 
 fn collect_audio_files(dir_path: &str) -> Result<Vec<RawFileData>> {
     use walkdir::WalkDir;
@@ -213,7 +247,6 @@ fn extract_tags(path: &Path) -> FileTags {
         comment: tag.as_ref().and_then(|t| t.comment().map(|s| s.to_string())),
     }
 }
-
 async fn process_groups_with_gpt(
     files: Vec<RawFileData>, 
     api_key: Option<String>,
@@ -224,7 +257,7 @@ async fn process_groups_with_gpt(
     
     let total_files = files.len();
     let start_time = Instant::now();
-    
+   
     // ADD THIS LINE:
     crate::progress::set_total_files(total_files);
     
@@ -288,81 +321,90 @@ async fn process_groups_with_gpt(
     let mut progress = crate::progress::ScanProgress::new(total_groups);
     let mut processed = 0;
     
-    for (folder_name, mut folder_files) in folder_map {
+    let series_groups: Vec<(String, Vec<RawFileData>)> = folder_map
+    .iter()
+    .filter(|(name, _)| {
+        let lower = name.to_lowercase();
+        lower.contains("book #") || lower.contains("book#") || lower.contains("(book ")
+    })
+    .map(|(k, v)| (k.clone(), v.clone()))
+    .collect();
+
+    // Collect keys BEFORE consuming series_groups
+    let series_keys: std::collections::HashSet<_> = series_groups.iter().map(|(k, _)| k.clone()).collect();
+// If we found multiple series books, process them all in parallel
+if series_groups.len() > 5 {
+    println!("🚀 Detected {} series books - processing in parallel", series_groups.len());
+    
+    let semaphore = Arc::new(Semaphore::new(max_workers));
+    let mut handles = Vec::new();
+    
+    for (folder_name, folder_files) in series_groups {
         if is_cancelled() {
-            println!("🛑 Scan cancelled by user");
             break;
         }
-        crate::progress::increment_progress(&folder_name);
         
-        println!("📁 Processing group: {} [{}]", folder_name, folder_files[0].id);
-        // ... rest of the existing code
-        processed += 1;
-        progress.update(processed, &folder_name, start_time, false);
-        if let Some(ref callback) = progress_callback {
-            callback(progress.clone());
-        }
+        let api_key_clone = api_key.clone();
+        let config_clone = config.clone();
+        let sem = Arc::clone(&semaphore);
         
-        folder_files.sort_by(|a, b| a.filename.cmp(&b.filename));
-        
-        let group_type = detect_group_type(&folder_files);
-        
-        println!("\n📁 Processing group: {}", folder_name);
-        println!("   Type: {:?}, Files: {}", group_type, folder_files.len());
-        
-        if matches!(group_type, GroupType::Series) && folder_files.len() > 1 {
-            println!("   📚 Series detected - processing each book separately");
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
             
-            for file in folder_files {
-                 if is_cancelled() {
-                    println!("🛑 Scan cancelled by user - stopping series processing");
-                    break;
-                }
-                let book_name = file.filename.replace(".m4b", "").replace(".m4a", "").replace(".mp3", "");
-                
-                println!("\n   📖 Book: {}", book_name);
-                println!("      🔍 Step 1: GPT extracts book info...");
-                let (book_title, book_author) = extract_book_info_with_gpt(
-                    &file,
-                    &book_name,
-                    api_key.as_deref()
-                ).await;
-                
-                println!("      ✅ Extracted: title='{}', author='{}'", book_title, book_author);
-                
-                let config = crate::config::load_config().ok();
-                
-                println!("      🎧 Step 2: Query Audible (Primary)...");
-                let audible_data = if let Some(ref cfg) = config {
-                    if cfg.audible_enabled && !cfg.audible_cli_path.is_empty() {
-                        crate::audible::search_audible(&book_title, &book_author, &cfg.audible_cli_path)
-                            .await.ok().flatten()
-                    } else {
-                        None
-                    }
+            crate::progress::increment_progress(&folder_name);
+            
+            let sample_file = find_best_sample_file(&folder_files);
+            
+            println!("\n📖 Processing: {}", folder_name);
+            
+            let (book_title, book_author) = extract_book_info_with_gpt(
+                sample_file,
+                &folder_name,
+                api_key_clone.as_deref()
+            ).await;
+            
+            let audible_data = if let Some(ref cfg) = config_clone {
+                if cfg.audible_enabled && !cfg.audible_cli_path.is_empty() {
+                    crate::audible::search_audible(&book_title, &book_author, &cfg.audible_cli_path)
+                        .await.ok().flatten()
                 } else {
                     None
-                };
-                
-                println!("      📚 Step 3: Query Google Books (Fallback)...");
-                let google_data = crate::metadata::fetch_from_google_books(&book_title, &book_author)
-                    .await.ok().flatten();
-                
-                println!("      🤖 Step 4: GPT merges all sources...");
-                let final_metadata = merge_all_with_gpt_retry(
-                    &[file.clone()],
-                    &book_name,
-                    &book_title,
-                    &book_author,
-                    google_data,
-                    audible_data,
-                    api_key.as_deref(),
-                    3
-                ).await;
-                
+                }
+            } else {
+                None
+            };
+            
+            let google_data = crate::metadata::fetch_from_google_books(&book_title, &book_author)
+                .await.ok().flatten();
+            
+            let final_metadata = merge_all_with_gpt_retry(
+                &folder_files,
+                &folder_name,
+                &book_title,
+                &book_author,
+                google_data,
+                audible_data,
+                api_key_clone.as_deref(),
+                3
+            ).await;
+            
+            (folder_name, folder_files, final_metadata)
+        });
+        
+        handles.push(handle);
+    }
+    
+    // Wait for all to complete
+    for handle in handles {
+        if is_cancelled() {
+            break;
+        }
+        
+        if let Ok((folder_name, folder_files, final_metadata)) = handle.await {
+            let audio_files: Vec<AudioFile> = folder_files.iter().map(|f| {
                 let mut changes = HashMap::new();
                 
-                if let Some(old_title) = &file.tags.title {
+                if let Some(old_title) = &f.tags.title {
                     if old_title != &final_metadata.title {
                         changes.insert("title".to_string(), FieldChange {
                             old: old_title.clone(),
@@ -371,7 +413,7 @@ async fn process_groups_with_gpt(
                     }
                 }
                 
-                if let Some(old_artist) = &file.tags.artist {
+                if let Some(old_artist) = &f.tags.artist {
                     if old_artist != &final_metadata.author {
                         changes.insert("author".to_string(), FieldChange {
                             old: old_artist.clone(),
@@ -382,14 +424,14 @@ async fn process_groups_with_gpt(
                 
                 if let Some(narrator) = &final_metadata.narrator {
                     changes.insert("narrator".to_string(), FieldChange {
-                        old: file.tags.comment.clone().unwrap_or_default(),
+                        old: f.tags.comment.clone().unwrap_or_default(),
                         new: format!("Narrated by {}", narrator),
                     });
                 }
                 
                 if !final_metadata.genres.is_empty() {
                     let new_genre = final_metadata.genres.join(", ");
-                    if let Some(old_genre) = &file.tags.genre {
+                    if let Some(old_genre) = &f.tags.genre {
                         if old_genre != &new_genre {
                             changes.insert("genre".to_string(), FieldChange {
                                 old: old_genre.clone(),
@@ -404,221 +446,181 @@ async fn process_groups_with_gpt(
                     }
                 }
                 
-                let audio_file = AudioFile {
-                    id: file.id.clone(),
-                    path: file.path.clone(),
-                    filename: file.filename.clone(),
-                    status: if changes.is_empty() { "unchanged" } else { "changed" }.to_string(),
-                    changes,
-                };
-                
-                let total_changes = if audio_file.changes.is_empty() { 0 } else { 1 };
-                
-                groups.push(BookGroup {
-                    id: group_id.to_string(),
-                    group_name: book_name,
-                    group_type: GroupType::Single,
-                    files: vec![audio_file],
-                    metadata: final_metadata,
-                    total_changes,
-                });
-                
-                group_id += 1;
-            }
-            
-            continue;
-        }
-        
-        let sample_file = &folder_files[0];
-        // OPTIMIZATION: Try cache FIRST before any GPT calls
-        let cache = crate::cache::MetadataCache::new().ok();
-        let config = crate::config::load_config().ok();
-        
-        // Quick check: try to extract title/author from filename for cache lookup
-        let quick_title = sample_file.tags.title.as_deref()
-            .unwrap_or(&folder_name);
-        let quick_author = sample_file.tags.artist.as_deref()
-            .or(sample_file.tags.album_artist.as_deref())
-            .unwrap_or("Unknown");
-        
-        // NEW: Check if file was already processed by our app
-        let already_processed = is_already_processed(&sample_file.tags);
-        if already_processed {
-            println!("   ✅ File already processed by this app - using existing tags directly");
-            println!("   📋 Title: {:?}", sample_file.tags.title);
-            println!("   📋 Comment: {:?}", sample_file.tags.comment);
-            println!("   📋 Genre: {:?}", sample_file.tags.genre);
-        }
-        
-        if already_processed {
-            println!("   ✅ File already processed by this app - using existing tags directly");
-            
-            // Extract existing tags directly without GPT reprocessing
-            let final_metadata = BookMetadata {
-                title: sample_file.tags.title.clone().unwrap_or_else(|| folder_name.clone()),
-                subtitle: None,
-                author: sample_file.tags.artist.clone().unwrap_or_else(|| "Unknown".to_string()),
-                narrator: sample_file.tags.comment.as_ref()
-                    .and_then(|c| {
-                        if c.starts_with("Narrated by ") {
-                            Some(c.trim_start_matches("Narrated by ").to_string())
-                        } else if c.starts_with("Read by ") {
-                            Some(c.trim_start_matches("Read by ").to_string())
-                        } else {
-                            None
-                        }
-                    }),
-                series: None,
-                sequence: None,
-                genres: sample_file.tags.genre.as_ref()
-                    .map(|g| g.split(',').map(|s| s.trim().to_string()).collect())
-                    .unwrap_or_default(),
-                publisher: None,
-                year: sample_file.tags.year.clone(),
-                description: None,
-                isbn: None,
-            };
-            
-            let audio_files: Vec<AudioFile> = folder_files.iter().map(|f| {
                 AudioFile {
                     id: f.id.clone(),
                     path: f.path.clone(),
                     filename: f.filename.clone(),
-                    status: "unchanged".to_string(),
-                    changes: HashMap::new(),
+                    status: if changes.is_empty() { "unchanged" } else { "changed" }.to_string(),
+                    changes,
                 }
             }).collect();
             
+            let total_changes = audio_files.iter().filter(|f| !f.changes.is_empty()).count();
+            
             groups.push(BookGroup {
                 id: group_id.to_string(),
-                group_name: folder_name.clone(),
-                group_type,
+                group_name: folder_name,
+                group_type: GroupType::Chapters,
                 files: audio_files,
                 metadata: final_metadata,
-                total_changes: 0,
+                total_changes,
             });
             
             group_id += 1;
-            continue;
+        }
+    }
+    // Remove processed series books from folder_map
+    folder_map.retain(|k, _| !series_keys.contains(k));
+}
+let remaining_groups: Vec<_> = folder_map.into_iter().collect();
+
+// Create cache instance for parallel processing
+let cache = crate::cache::MetadataCache::new().ok();
+
+if !remaining_groups.is_empty() {
+    println!("🚀 Processing {} groups in parallel (max {} concurrent)", 
+             remaining_groups.len(), max_workers);
+    
+    let semaphore = Arc::new(Semaphore::new(max_workers));
+    let mut handles = Vec::new();
+    
+    for (folder_name, folder_files) in remaining_groups {
+        if is_cancelled() {
+            break;
         }
         
-        // Check cache with quick lookup first
-        if let Some(ref cache_db) = cache {
-            if let Some(cached) = cache_db.get(quick_title, quick_author) {
-                println!("   💾 Using cached metadata (FAST PATH - skipping ALL GPT calls)");
-                
-                let final_metadata = cached.final_metadata;
+        let api_key_clone = api_key.clone();
+        let config_clone = config.clone();
+        let cache_clone = cache.clone();
+        let sem = Arc::clone(&semaphore);
+        let group_id_clone = group_id;
+        group_id += 1;
+        
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            
+            crate::progress::increment_progress(&folder_name);
+            
+            let sample_file = find_best_sample_file(&folder_files);
+            
+            // Check if already processed
+            let already_processed = is_already_processed(&sample_file.tags);
+            
+            if already_processed {
+                let final_metadata = BookMetadata {
+                    title: sample_file.tags.title.clone().unwrap_or_else(|| folder_name.clone()),
+                    subtitle: None,
+                    author: sample_file.tags.artist.clone().unwrap_or_else(|| "Unknown".to_string()),
+                    narrator: sample_file.tags.comment.as_ref()
+                        .and_then(|c| {
+                            if c.starts_with("Narrated by ") {
+                                Some(c.trim_start_matches("Narrated by ").to_string())
+                            } else if c.starts_with("Read by ") {
+                                Some(c.trim_start_matches("Read by ").to_string())
+                            } else {
+                                None
+                            }
+                        }),
+                    series: None,
+                    sequence: None,
+                    genres: sample_file.tags.genre.as_ref()
+                        .map(|g| g.split(',').map(|s| s.trim().to_string()).collect())
+                        .unwrap_or_default(),
+                    publisher: None,
+                    year: sample_file.tags.year.clone(),
+                    description: None,
+                    isbn: None,
+                };
                 
                 let audio_files: Vec<AudioFile> = folder_files.iter().map(|f| {
-                    let mut changes = HashMap::new();
-                    
-                    if let Some(old_title) = &f.tags.title {
-                        if old_title != &final_metadata.title {
-                            changes.insert("title".to_string(), FieldChange {
-                                old: old_title.clone(),
-                                new: final_metadata.title.clone(),
-                            });
-                        }
-                    }
-                    
-                    if let Some(old_artist) = &f.tags.artist {
-                        if old_artist != &final_metadata.author {
-                            changes.insert("author".to_string(), FieldChange {
-                                old: old_artist.clone(),
-                                new: final_metadata.author.clone(),
-                            });
-                        }
-                    }
-                    
-                    if let Some(narrator) = &final_metadata.narrator {
-                        changes.insert("narrator".to_string(), FieldChange {
-                            old: f.tags.comment.clone().unwrap_or_default(),
-                            new: format!("Narrated by {}", narrator),
-                        });
-                    }
-                    
-                    if !final_metadata.genres.is_empty() {
-                        let new_genre = final_metadata.genres.join(", ");
-                        if let Some(old_genre) = &f.tags.genre {
-                            if old_genre != &new_genre {
-                                changes.insert("genre".to_string(), FieldChange {
-                                    old: old_genre.clone(),
-                                    new: new_genre,
-                                });
-                            }
-                        } else {
-                            changes.insert("genre".to_string(), FieldChange {
-                                old: String::new(),
-                                new: new_genre,
-                            });
-                        }
-                    }
-                    
                     AudioFile {
                         id: f.id.clone(),
                         path: f.path.clone(),
                         filename: f.filename.clone(),
-                        status: if changes.is_empty() { "unchanged" } else { "changed" }.to_string(),
-                        changes,
+                        status: "unchanged".to_string(),
+                        changes: HashMap::new(),
                     }
                 }).collect();
                 
-                let total_changes = audio_files.iter().filter(|f| !f.changes.is_empty()).count();
-                
-                groups.push(BookGroup {
-                    id: group_id.to_string(),
-                    group_name: folder_name.clone(),
-                    group_type,
-                    files: audio_files,
-                    metadata: final_metadata,
-                    total_changes,
-                });
-                
-                group_id += 1;
-                continue;
+                return (group_id_clone, folder_name, GroupType::Chapters, audio_files, final_metadata, 0);
             }
-        }
-        
-        // CACHE MISS - Need to do full processing
-        println!("   🔍 Step 1: GPT extracts book info from tags...");
-        let (book_title, book_author) = extract_book_info_with_gpt(
-            sample_file,
-            &folder_name,
-            api_key.as_deref()
-        ).await;
-        
-        println!("   ✅ Extracted: title='{}', author='{}'", book_title, book_author);
-        
-        let cache = crate::cache::MetadataCache::new().ok();
-        
-        let (audible_data, google_data) = if let Some(ref cache_db) = cache {
-            // This shouldn't happen since we checked cache above, but keeping for safety
-            if let Some(_cached) = cache_db.get(&book_title, &book_author) {
-                println!("   💾 Using cached metadata");
-                // This case is now handled above, but keeping fallback
-                (None, None)
-            } else {
-                println!("   🎧 Step 2: Query Audible (Primary)...");
-                let audible = if let Some(ref cfg) = config {
-                    if cfg.audible_enabled && !cfg.audible_cli_path.is_empty() {
-                        crate::audible::search_audible(&book_title, &book_author, &cfg.audible_cli_path)
-                            .await.ok().flatten()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                
-                println!("   📚 Step 3: Query Google Books (Fallback)...");
-                let google = crate::metadata::fetch_from_google_books(&book_title, &book_author)
-                    .await.ok().flatten();
-                
-                (audible, google)
+            
+            // Check cache
+            let quick_title = sample_file.tags.title.as_deref().unwrap_or(&folder_name);
+            let quick_author = sample_file.tags.artist.as_deref().unwrap_or("Unknown");
+            
+            if let Some(ref cache_db) = cache_clone {
+                if let Some(cached) = cache_db.get(quick_title, quick_author) {
+                    let final_metadata = cached.final_metadata;
+                    
+                    let audio_files: Vec<AudioFile> = folder_files.iter().map(|f| {
+                        let mut changes = HashMap::new();
+                        
+                        if let Some(old_title) = &f.tags.title {
+                            if old_title != &final_metadata.title {
+                                changes.insert("title".to_string(), FieldChange {
+                                    old: old_title.clone(),
+                                    new: final_metadata.title.clone(),
+                                });
+                            }
+                        }
+                        
+                        if let Some(old_artist) = &f.tags.artist {
+                            if old_artist != &final_metadata.author {
+                                changes.insert("author".to_string(), FieldChange {
+                                    old: old_artist.clone(),
+                                    new: final_metadata.author.clone(),
+                                });
+                            }
+                        }
+                        
+                        if let Some(narrator) = &final_metadata.narrator {
+                            changes.insert("narrator".to_string(), FieldChange {
+                                old: f.tags.comment.clone().unwrap_or_default(),
+                                new: format!("Narrated by {}", narrator),
+                            });
+                        }
+                        
+                        if !final_metadata.genres.is_empty() {
+                            let new_genre = final_metadata.genres.join(", ");
+                            if let Some(old_genre) = &f.tags.genre {
+                                if old_genre != &new_genre {
+                                    changes.insert("genre".to_string(), FieldChange {
+                                        old: old_genre.clone(),
+                                        new: new_genre,
+                                    });
+                                }
+                            } else {
+                                changes.insert("genre".to_string(), FieldChange {
+                                    old: String::new(),
+                                    new: new_genre,
+                                });
+                            }
+                        }
+                        
+                        AudioFile {
+                            id: f.id.clone(),
+                            path: f.path.clone(),
+                            filename: f.filename.clone(),
+                            status: if changes.is_empty() { "unchanged" } else { "changed" }.to_string(),
+                            changes,
+                        }
+                    }).collect();
+                    
+                    let total_changes = audio_files.iter().filter(|f| !f.changes.is_empty()).count();
+                    
+                    return (group_id_clone, folder_name, GroupType::Chapters, audio_files, final_metadata, total_changes);
+                }
             }
-        } else {
-            println!("   🎧 Step 2: Query Audible (Primary)...");
-            let audible = if let Some(ref cfg) = config {
+            
+            // Full processing
+            let (book_title, book_author) = extract_book_info_with_gpt(
+                sample_file,
+                &folder_name,
+                api_key_clone.as_deref()
+            ).await;
+            
+            let audible_data = if let Some(ref cfg) = config_clone {
                 if cfg.audible_enabled && !cfg.audible_cli_path.is_empty() {
                     crate::audible::search_audible(&book_title, &book_author, &cfg.audible_cli_path)
                         .await.ok().flatten()
@@ -629,112 +631,162 @@ async fn process_groups_with_gpt(
                 None
             };
             
-            println!("   📚 Step 3: Query Google Books (Fallback)...");
-            let google = crate::metadata::fetch_from_google_books(&book_title, &book_author)
+            let google_data = crate::metadata::fetch_from_google_books(&book_title, &book_author)
                 .await.ok().flatten();
             
-            (audible, google)
-        };
-        
-        println!("   🤖 Step 4: GPT merges all sources...");
-        let final_metadata = merge_all_with_gpt_retry(
-            &folder_files,
-            &folder_name,
-            &book_title,
-            &book_author,
-            google_data,
-            audible_data,
-            api_key.as_deref(),
-            3
-        ).await;
-        
-        // Store FINAL metadata in cache for next time
-        if let Some(ref cache_db) = cache {
-            let _ = cache_db.set(&book_title, &book_author, crate::cache::CachedMetadata {
-                final_metadata: final_metadata.clone(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            });
-        }
-        
-        let audio_files: Vec<AudioFile> = folder_files.iter().map(|f| {
-            let mut changes = HashMap::new();
+            let final_metadata = merge_all_with_gpt_retry(
+                &folder_files,
+                &folder_name,
+                &book_title,
+                &book_author,
+                google_data,
+                audible_data,
+                api_key_clone.as_deref(),
+                3
+            ).await;
             
-            if let Some(old_title) = &f.tags.title {
-                if old_title != &final_metadata.title {
-                    changes.insert("title".to_string(), FieldChange {
-                        old: old_title.clone(),
-                        new: final_metadata.title.clone(),
-                    });
-                }
-            }
-            
-            if let Some(old_artist) = &f.tags.artist {
-                if old_artist != &final_metadata.author {
-                    changes.insert("author".to_string(), FieldChange {
-                        old: old_artist.clone(),
-                        new: final_metadata.author.clone(),
-                    });
-                }
-            }
-            
-            if let Some(narrator) = &final_metadata.narrator {
-                changes.insert("narrator".to_string(), FieldChange {
-                    old: f.tags.comment.clone().unwrap_or_default(),
-                    new: format!("Narrated by {}", narrator),
+            // Cache it
+            if let Some(ref cache_db) = cache_clone {
+                let _ = cache_db.set(&book_title, &book_author, crate::cache::CachedMetadata {
+                    final_metadata: final_metadata.clone(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
                 });
             }
             
-            if !final_metadata.genres.is_empty() {
-                let new_genre = final_metadata.genres.join(", ");
-                if let Some(old_genre) = &f.tags.genre {
-                    if old_genre != &new_genre {
+            let audio_files: Vec<AudioFile> = folder_files.iter().map(|f| {
+                let mut changes = HashMap::new();
+                
+                if let Some(old_title) = &f.tags.title {
+                    if old_title != &final_metadata.title {
+                        changes.insert("title".to_string(), FieldChange {
+                            old: old_title.clone(),
+                            new: final_metadata.title.clone(),
+                        });
+                    }
+                }
+                
+                if let Some(old_artist) = &f.tags.artist {
+                    if old_artist != &final_metadata.author {
+                        changes.insert("author".to_string(), FieldChange {
+                            old: old_artist.clone(),
+                            new: final_metadata.author.clone(),
+                        });
+                    }
+                }
+                
+                if let Some(narrator) = &final_metadata.narrator {
+                    changes.insert("narrator".to_string(), FieldChange {
+                        old: f.tags.comment.clone().unwrap_or_default(),
+                        new: format!("Narrated by {}", narrator),
+                    });
+                }
+                
+                if !final_metadata.genres.is_empty() {
+                    let new_genre = final_metadata.genres.join(", ");
+                    if let Some(old_genre) = &f.tags.genre {
+                        if old_genre != &new_genre {
+                            changes.insert("genre".to_string(), FieldChange {
+                                old: old_genre.clone(),
+                                new: new_genre,
+                            });
+                        }
+                    } else {
                         changes.insert("genre".to_string(), FieldChange {
-                            old: old_genre.clone(),
+                            old: String::new(),
                             new: new_genre,
                         });
                     }
-                } else {
-                    changes.insert("genre".to_string(), FieldChange {
-                        old: String::new(),
-                        new: new_genre,
-                    });
                 }
-            }
+                
+                AudioFile {
+                    id: f.id.clone(),
+                    path: f.path.clone(),
+                    filename: f.filename.clone(),
+                    status: if changes.is_empty() { "unchanged" } else { "changed" }.to_string(),
+                    changes,
+                }
+            }).collect();
             
-            AudioFile {
-                id: f.id.clone(),
-                path: f.path.clone(),
-                filename: f.filename.clone(),
-                status: if changes.is_empty() { "unchanged" } else { "changed" }.to_string(),
-                changes,
-            }
-        }).collect();
-        
-        let total_changes = audio_files.iter().filter(|f| !f.changes.is_empty()).count();
-        
-        groups.push(BookGroup {
-            id: group_id.to_string(),
-            group_name: folder_name,
-            group_type,
-            files: audio_files,
-            metadata: final_metadata,
-            total_changes,
+            let total_changes = audio_files.iter().filter(|f| !f.changes.is_empty()).count();
+            
+            (group_id_clone, folder_name, GroupType::Chapters, audio_files, final_metadata, total_changes)
         });
         
-        group_id += 1;
+        handles.push(handle);
     }
     
-    groups.sort_by(|a, b| a.group_name.cmp(&b.group_name));
-    
-    let elapsed = start_time.elapsed();
-    let rate = total_files as f64 / elapsed.as_secs_f64();
-    println!("\n⚡ Performance: {:.1} files/sec, total time: {:?}", rate, elapsed);
-    
+    // Collect results
+    for handle in handles {
+        if is_cancelled() {
+            break;
+        }
+        
+        if let Ok((id, name, group_type, files, metadata, total_changes)) = handle.await {
+            groups.push(BookGroup {
+                id: id.to_string(),
+                group_name: name,
+                group_type,
+                files,
+                metadata,
+                total_changes,
+            });
+        }
+    }
+}
+
+groups.sort_by(|a, b| a.group_name.cmp(&b.group_name));
+
+let elapsed = start_time.elapsed();
+let rate = total_files as f64 / elapsed.as_secs_f64();
+println!("\n⚡ Performance: {:.1} files/sec, total time: {:?}", rate, elapsed);
+
     groups
 }
+// Add this function before extract_book_info_with_gpt
+fn find_best_sample_file(files: &[RawFileData]) -> &RawFileData {
+    for file in files {
+        if let Some(title) = &file.tags.title {
+            let lower = title.to_lowercase();
+            if lower.starts_with("track") || 
+               lower.starts_with("chapter") || 
+               lower.starts_with("part") ||
+               lower.chars().filter(|c| c.is_numeric()).count() > 3 {
+                continue;
+            }
+            if title.len() > 10 {
+                return file;
+            }
+        }
+    }
+    &files[0]
+}
+
+fn extract_book_number_from_folder(folder_name: &str) -> Option<String> {
+    use regex::Regex;
+    
+    let patterns = [
+        r"(?i)\(Book\s*#?(\d+)\)",
+        r"(?i)\[Book\s*#?(\d+)\]",
+        r"(?i)Book\s*#?(\d+)",
+        r"(?i)#(\d+)",
+    ];
+    
+    for pattern in &patterns {
+        if let Ok(re) = Regex::new(pattern) {
+            if let Some(caps) = re.captures(folder_name) {
+                if let Some(num) = caps.get(1) {
+                    return Some(num.as_str().to_string());
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 async fn extract_book_info_with_gpt(
     sample_file: &RawFileData,
     folder_name: &str,
@@ -750,74 +802,110 @@ async fn extract_book_info_with_gpt(
         }
     };
     
-    // Clean our own formatting before sending to GPT
     let clean_title = sample_file.tags.title.as_ref()
         .map(|t| t.replace(" - Part 1", "").replace(" - Part 2", "").trim().to_string());
     let clean_artist = sample_file.tags.artist.as_ref()
         .map(|a| a.to_string());
     
+    let book_number = extract_book_number_from_folder(folder_name);
+    let book_hint = if let Some(num) = &book_number {
+        format!("\nBOOK NUMBER DETECTED: This is Book #{} in a series", num)
+    } else {
+        String::new()
+    };
+    
     let prompt = format!(
-r#"Extract the BOOK title and AUTHOR from these audiobook file tags. Ignore chapter/track numbers.
+
+r#"You are extracting the actual book title and author from audiobook tags.
 
 FOLDER NAME: {}
 FILENAME: {}
 FILE TAGS:
-- Title: {:?}
-- Artist: {:?}
-- Album: {:?}
+* Title: {:?}
+* Artist: {:?}
+* Album: {:?}{}
 
-IMPORTANT: These tags may have been cleaned already. Use them directly if they look clean.
-- If title is already clean (no track numbers, no junk), use it as-is
-- If artist is already clean, use it as-is
+PRIMARY RULES:
+1. Ignore titles that are generic such as Track 01, Chapter 1, Part 1.
+2. Prefer the folder name or album field when the title tag is generic or incomplete.
+3. If the folder or filename includes a series marker like (Book #39), use the number to identify the specific book title.
+4. Always output the specific book title, not only the series name.
+5. Remove all track numbers, chapter numbers, punctuation clutter, and formatting noise.
 
-The tags might be messy (e.g., "Track 10" or "Magic Tree House - #55 Night of the Ninth Dragon").
+CORRECT TITLE EXTRACTION:
+The title must be the specific book name only. Remove all series markers including (Book #X), Book X, #X:, and any series name inside parentheses.
 
-Extract the actual BOOK title and AUTHOR name. Remove:
-- Track/Chapter numbers
-- Book numbers (#54, #55, etc)
-- Series markers
-- File format info (320kbps, Unabridged, etc)
+Examples:
+* "Magic Tree House #46: Dogs In The Dead Of Night" → "Dogs in the Dead of Night"
+* "Hi, Jack? (The Magic Tree House, Book 28)" → "High Time for Heroes"
+* "The Magic Tree House: Book 51" → use folder or album if it contains the real title
 
-Return ONLY valid JSON:
-{{"book_title":"actual book title","author":"author name"}}
+ADDITIONAL LOGIC:
+If the title tag contains only a series name or a placeholder, rely on folder or album fields to determine the true book title.
+
+Return only valid JSON:
+{{"book_title":"specific book title","author":"author name"}}
 
 JSON:"#,
         folder_name,
         sample_file.filename,
         clean_title,
         clean_artist,
-        sample_file.tags.album
+        sample_file.tags.album,
+        book_hint
     );
     
-    match call_gpt_extract_book_info(&prompt, api_key).await {
-        Ok(json_str) => {
-            match serde_json::from_str::<serde_json::Value>(&json_str) {
-                Ok(json) => {
-                    let title = json["book_title"].as_str()
-                        .unwrap_or(&sample_file.tags.title.as_deref().unwrap_or(folder_name))
-                        .to_string();
-                    let author = json["author"].as_str()
-                        .unwrap_or(&sample_file.tags.artist.as_deref().unwrap_or("Unknown"))
-                        .to_string();
-                    (title, author)
+    for attempt in 1..=2 {
+        match call_gpt_extract_book_info(&prompt, api_key).await {
+            Ok(json_str) => {
+                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                    Ok(json) => {
+                        let title = json["book_title"].as_str()
+                            .unwrap_or(&sample_file.tags.title.as_deref().unwrap_or(folder_name))
+                            .to_string();
+                        let author = json["author"].as_str()
+                            .unwrap_or(&sample_file.tags.artist.as_deref().unwrap_or("Unknown"))
+                            .to_string();
+                        
+                        if title.to_lowercase().contains("track") || 
+                           title.to_lowercase().contains("chapter") ||
+                           title.to_lowercase().contains("part") {
+                            if attempt == 2 {
+                                return (folder_name.to_string(), author);
+                            }
+                            continue;
+                        }
+                        
+                        return (title, author);
+                    }
+                    Err(_) => {
+                        if attempt == 2 {
+                            return (
+                                sample_file.tags.title.clone().unwrap_or_else(|| folder_name.to_string()),
+                                sample_file.tags.artist.clone().unwrap_or_else(|| String::from("Unknown"))
+                            );
+                        }
+                    }
                 }
-                Err(_) => {
-                    (
+            }
+            Err(e) => {
+                println!("   ⚠️  GPT extraction error (attempt {}): {}", attempt, e);
+                if attempt == 2 {
+                    return (
                         sample_file.tags.title.clone().unwrap_or_else(|| folder_name.to_string()),
                         sample_file.tags.artist.clone().unwrap_or_else(|| String::from("Unknown"))
-                    )
+                    );
                 }
             }
         }
-        Err(e) => {
-            println!("   ⚠️  GPT extraction error: {}", e);
-            (
-                sample_file.tags.title.clone().unwrap_or_else(|| folder_name.to_string()),
-                sample_file.tags.artist.clone().unwrap_or_else(|| String::from("Unknown"))
-            )
-        }
     }
+    
+    (
+        sample_file.tags.title.clone().unwrap_or_else(|| folder_name.to_string()),
+        sample_file.tags.artist.clone().unwrap_or_else(|| String::from("Unknown"))
+    )
 }
+
 async fn merge_all_with_gpt(
     files: &[RawFileData],
     folder_name: &str,
@@ -890,7 +978,8 @@ async fn merge_all_with_gpt(
     };
     
     let prompt = format!(
-r#"You are an audiobook metadata expert. Merge data from multiple sources into the best metadata.
+r#"
+You are an audiobook metadata specialist. Combine information from all sources to produce the most accurate metadata.
 
 SOURCES:
 1. Folder: {}
@@ -898,30 +987,54 @@ SOURCES:
 3. Google Books: {}
 4. Audible: {}
 5. Sample comments: {:?}
-6. FILENAME HINT: Look at folder/filename for series info
+6. Filename hint: Use folder or filename to detect series information
 
-INSTRUCTIONS FOR SERIES:
-If folder has patterns like Book 01 or War of The Roses 01, extract series and sequence.
+SERIES RULES:
+If the folder or filename includes patterns like Book 01 or War of the Roses 01, extract the series name and the book number.
 
-APPROVED GENRES (max 3, comma-separated):
+APPROVED GENRES (maximum 3, comma separated):
 {}
 
-OUTPUT ALL FIELDS:
-- title: Book title (not chapter). Remove junk.
-- subtitle: If available from Google Books or Audible
-- author: Clean author name
-- narrator: Extract from Audible narrators field or look for Narrated by in comments
-- series: Extract from filename pattern if book number present
-- sequence: Book number
-- sequence: Extract book number from filename (e.g., "01" or "02")
-- genres: Pick 1-3 from approved list
-- publisher: From Google Books or Audible
-- {}
-- description: Brief description from Google/Audible
-- isbn: From Google Books
+OUTPUT FIELDS:
+* title: Book title only. Remove junk and remove all series markers.
+* subtitle: Use only if provided by Google Books or Audible.
+* author: Clean and standardized.
+* narrator: Use Audible narrators or find in comments.
+* series: Extract from filename or folder if present.
+* sequence: Extract book number from any source including patterns like 01 or 02.
+* genres: Select one to three from the approved list. If the book is for children, always include "Children's" from the approved list.
+* publisher: Prefer Google Books or Audible.
+* {}
+* description: Short description from Google Books or Audible, minimum length 200 characters.
+* isbn: From Google Books.
+
+TITLE RULES:
+The title must contain only the specific book title. Remove all series indicators such as Book X, Book #X, #X:, or any series name in parentheses.
+
+Correct examples:
+* "Night of the Ninjas"
+* "Dogs in the Dead of Night"
+* "High Time for Heroes"
+
+Incorrect examples:
+* "Magic Tree House #46: Dogs in the Dead of Night"
+* "The Magic Tree House: Book 51"
+* "Hi, Jack? (The Magic Tree House)"
 
 Return ONLY valid JSON:
-{{"title":"...","subtitle":null,"author":"...","narrator":"...","series":"...","sequence":"...","genres":["..."],"publisher":"...","year":"...","description":"...","isbn":"..."}}
+{{
+  "title": "specific book title",
+  "subtitle": null,
+  "author": "author name",
+  "narrator": "narrator name or null",
+  "series": "series name or null",
+  "sequence": "book number or null",
+  "genres": ["Genre1", "Genre2"],
+  "publisher": "publisher or null",
+  "year": "YYYY or null",
+  "description": "description or null",
+  "isbn": "isbn or null"
+}}
 
 JSON:"#,
         folder_name,

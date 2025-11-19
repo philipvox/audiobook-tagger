@@ -4,6 +4,8 @@ use lofty::probe::Probe;
 use lofty::file::{TaggedFileExt, AudioFile};
 use lofty::tag::{Accessor, Tag, ItemKey, ItemValue, TagItem};
 use serde::{Serialize, Deserialize};
+use tokio::sync::Semaphore;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteResult {
@@ -17,6 +19,35 @@ pub struct WriteError {
     pub file_id: String,
     pub path: String,
     pub error: String,
+}
+
+pub async fn write_files_parallel(
+    files: Vec<(String, std::collections::HashMap<String, crate::scanner::FieldChange>)>,
+    backup: bool,
+    max_concurrent: usize,
+) -> Result<Vec<Result<(), anyhow::Error>>> {
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let mut handles = Vec::new();
+    
+    for (path, changes) in files {
+        let sem = Arc::clone(&semaphore);
+        let path_clone = path.clone();
+        let changes_clone = changes.clone();
+        
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            write_file_tags(&path_clone, &changes_clone, backup).await
+        });
+        
+        handles.push(handle);
+    }
+    
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+    
+    Ok(results)
 }
 
 pub async fn write_file_tags(
@@ -40,10 +71,7 @@ pub async fn write_file_tags(
             format!("{}.backup", path.extension().unwrap_or_default().to_string_lossy())
         );
         std::fs::copy(path, &backup_path)?;
-        println!("📋 Backup created: {}", backup_path.display());
     }
-    
-    println!("📝 Writing tags to: {}", file_path);
     
     let mut tagged_file = match Probe::open(path) {
         Ok(probe) => probe,
@@ -70,8 +98,6 @@ pub async fn write_file_tags(
     };
     
     for (field, change) in changes {
-        println!("   🔧 Updating {}: '{}' -> '{}'", field, change.old, change.new);
-        
         match field.as_str() {
             "title" => {
                 tag.remove_key(&ItemKey::TrackTitle);
@@ -101,15 +127,11 @@ pub async fn write_file_tags(
                     );
                     tag.push(item);
                 }
-                
-                println!("   ✅ Wrote {} separate genre tags: {:?}", genres.len(), genres);
             },
             "narrator" => {
                 tag.remove_key(&ItemKey::Composer);
                 tag.insert_text(ItemKey::Composer, change.new.clone());
                 tag.remove_key(&ItemKey::Comment);
-                
-                println!("   ✅ Wrote narrator to Composer: {}", change.new);
             },
             "description" | "comment" => {
                 if !change.new.to_lowercase().contains("narrated by") {
@@ -129,18 +151,12 @@ pub async fn write_file_tags(
                 tag.insert_text(ItemKey::Unknown("SERIES-PART".to_string()), change.new.clone());
                 tag.insert_text(ItemKey::Unknown("series-part".to_string()), change.new.clone());
             },
-            _ => {
-                println!("   ⚠️  Unknown field type: {}", field);
-            }
+            _ => {}
         }
     }
     
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    
     file_content.save_to_path(path, lofty::config::WriteOptions::default())
         .map_err(|e| anyhow::anyhow!("Failed to save tags: {}", e))?;
-    
-    println!("✅ Saved tags to: {}", file_path);
     
     Ok(())
 }
